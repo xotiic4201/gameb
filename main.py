@@ -77,7 +77,7 @@ app = FastAPI(title="NEXUS Tracking System API")
 # CORS for frontend only
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000"],
+    allow_origins=[FRONTEND_URL, "https://gamef-swart.vercel.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
