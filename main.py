@@ -477,12 +477,6 @@ async def health():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.get("/")
-async def root():
-    """Serve the frontend"""
-    with open('index.html', 'r') as f:
-        html_content = f.read()
-    return HTMLResponse(content=html_content)
 
 # ==================== RUN BOTH SERVERS ====================
 async def run_bot():
