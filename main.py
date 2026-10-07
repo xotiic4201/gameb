@@ -28,9 +28,8 @@ PORT = int(os.getenv('PORT', 8000))
 FRONTEND_URL = "https://gamef-swart.vercel.app"
 
 # Your Discord IDs
-YOUR_DISCORD_ID = 1302203907782606880
-BOY_DISCORD_ID = 1151697240025464852
-
+YOUR_DISCORD_ID = os.getenv('YOUR_DISCORD_ID')
+BOY_DISCORD_ID = os.getenv('BOY_DISCORD_ID')
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set in .env")
     exit(1)
