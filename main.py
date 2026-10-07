@@ -25,7 +25,7 @@ load_dotenv()
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 PORT = int(os.getenv('PORT', 8000))
-FRONTEND_URL = "https://gamef4.vercel.app/"
+FRONTEND_URL = "https://gamef-gray.vercel.app/"
 
 # Your Discord IDs
 YOUR_DISCORD_ID = os.getenv('YOUR_DISCORD_ID')
